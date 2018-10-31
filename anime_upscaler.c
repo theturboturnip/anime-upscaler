@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/wait.h>
+#include <sys/types.h>
 
 typedef unsigned char BYTE;
 
@@ -48,6 +49,7 @@ BYTE* expandable_buffer_increase_size(expandable_buffer* buffer, size_t size_del
 	
 	buffer->size += size_delta;
 	if (buffer->size > buffer->capacity){
+		size_t old_capacity = buffer->capacity;
 		buffer->capacity = buffer->size - (buffer->size % 8) + 8;
 		assert(buffer->capacity >= buffer->size);
 		buffer->pointer = (BYTE*)realloc(buffer->pointer, buffer->capacity);
@@ -177,26 +179,35 @@ void pipe_data_close_write_to(pipe_data* pipe){
 	pipe->files.write_to = -1;
 }
 
-int run_command(pipe_data* pipe, char* const command[], char* working_directory){
-	int process_id = fork();
+int run_command(char* const command[], char* working_directory, pipe_data* input_pipe, pipe_data* output_pipe){
+	pid_t process_id = fork();
 	switch(process_id){
 	case -1:
 		fprintf(stderr, "fork() failed\n");
 		exit(1);
 	case 0:
-		
 		// We are the new process, start the command
-		if (pipe != NULL){
+		if (input_pipe != NULL){
+			// Redirect stdin
+			if (dup2(input_pipe->files.read_from, 0) < 0){
+				pipe_data_close_read_from(input_pipe);
+				fprintf(stderr, "Failed to redirect input for command\n");
+				exit(1);
+			}
+			pipe_data_close_write_to(input_pipe); // We don't need this anymore
+		}
+		if (output_pipe != NULL){
 			// Redirect stdout
-			if (dup2(pipe->files.write_to, 1) < 0){
-				pipe_data_close_write_to(pipe);
+			if (dup2(output_pipe->files.write_to, 1) < 0){
+				pipe_data_close_write_to(output_pipe);
 				fprintf(stderr, "Failed to redirect output for command\n");
 				exit(1);
 			}
-			pipe_data_close_read_from(pipe); // We don't need this anymore
+			fprintf(stderr, "Redirected output for command\n");
+			pipe_data_close_read_from(output_pipe); // We don't need this anymore
 		}
 		// Redirect stderr to /dev/null
-		//freopen("/dev/null", "w", stderr);
+		freopen("/dev/null", "w", stderr);
 		if (working_directory != NULL){
 			chdir(working_directory);
 		}
@@ -210,6 +221,32 @@ int run_command(pipe_data* pipe, char* const command[], char* working_directory)
 	return process_id;
 }
 
+typedef struct {
+	char absolute_filename[PATH_MAX];
+	FILE* file;
+} temp_file;
+temp_file* create_temp_file(char* access_type){
+	char filename[] = "anime-upscaler-tempfile-XXXXXX";
+	int file_descriptor = mkstemp(filename);
+	if (file_descriptor == -1){
+		fprintf(stderr, "Failed to create temp file\n");
+		exit(1);
+	}
+
+	temp_file* tfile = malloc(sizeof(temp_file));
+	
+	realpath(filename, tfile->absolute_filename);
+	tfile->file = fdopen(file_descriptor, access_type);
+	return tfile;
+}
+void free_temp_file(temp_file** tfile_pointer){
+	// The temp file will automatically be destroyed once unlinked
+	unlink((*tfile_pointer)->absolute_filename);
+	fclose((*tfile_pointer)->file);
+	free(*tfile_pointer);
+	*tfile_pointer = NULL;
+}
+
 int main(int argc, char* argv[]){
 	/*if (argc == 1){
 	  fprintf(stderr, "Not enough arguments!\n");
@@ -219,91 +256,66 @@ int main(int argc, char* argv[]){
 	expandable_buffer buffer = create_expandable_buffer(initial_buffer_size);
 	//expandable_buffer_print(&buffer);
 
-
-	char frame_filename[] = "anime-upscaler-tempfile-XXXXXX.png";
-	/*int frame_file_descriptor = mkstemp(frame_filename);
+	temp_file* input_frame = create_temp_file("wb");
+	/*char input_frame_filename[] = "anime-upscaler-tempfile-XXXXXX.png";
+	int frame_file_descriptor = mkstemp(frame_filename);
 	if (frame_file_descriptor == -1){
 		fprintf(stderr, "Failed to create temp file\n");
 		return 1;
-		}*/
-	FILE* frame_file = fopen(frame_filename, "wb");//fdopen(frame_file_descriptor, "wb");
+	}
+	char input_frame_filename_absolute[PATH_MAX];
+	realpath(input_frame_filename, input_frame_filename_absolute);
+	FILE* input_frame_file = fdopen(frame_file_descriptor, "wb");*/
 
-	FILE* output_file = fopen("./test.png", "wb");
+	temp_file* output_frame = create_temp_file("rb");
 
-	// Create a pipe to use with the ffmpeg input process
-	pipe_data pipe_from_source = create_pipe_data();
-
-    // Create a new process for the ffmpeg image splitting
-	char* ffmpeg_command[] = { "ffmpeg", "-y", "-i", "small.mp4", "-vcodec", "png", "-f", "image2pipe", "-", NULL };
-
-	int ffmpeg_input_process_pid = run_command(&pipe_from_source, ffmpeg_command, NULL);
-	pipe_data_close_write_to(&pipe_from_source);
-	
+	// Set up the ffmpeg source daemon
+	pipe_data ffmpeg_source_output_pipe = create_pipe_data();
+	char* ffmpeg_source_command[] = { "ffmpeg", "-y", "-i", "small.mp4", "-vcodec", "png", "-f", "image2pipe", "-", NULL };
+	pid_t ffmpeg_source_pid = run_command(ffmpeg_source_command, NULL, NULL, &ffmpeg_source_output_pipe);
+	pipe_data_close_write_to(&ffmpeg_source_output_pipe); // We shouldn't be able to write to the output
 	// Open the ffmpeg pipe output as a file
-    FILE *ffmpeg_pipein = fdopen(pipe_from_source.files.read_from, "r");
+    FILE *ffmpeg_source_output = fdopen(ffmpeg_source_output_pipe.files.read_from, "r");
 
-	// NOTE: For waifu2x file output, use -o /dev/stdout
-	char actual_frame_path[PATH_MAX + 1];
-	realpath(frame_filename, actual_frame_path);
-	char* waifu2x_command[] = { "th", "./waifu2x.lua", "-m", "scale",  "-i", actual_frame_path, "-o", "/dev/stdout", NULL };
+	/*pipe_data ffmpeg_source_input_pipe = create_pipe_data();
+	char* ffmpeg_source_command[] = { "ffmpeg", "-y", "-vcodec", "png", "-f", "image2pipe" "-i", "-", NULL };
+	pid_t ffmpeg_source_pid = run_command(&pipe_from_source, ffmpeg_command, NULL);
+	pipe_data_close_write_to(&ffmpeg_source_output_pipe); // We shouldn't be able to write to the output
+	// Open the ffmpeg pipe output as a file
+    FILE *ffmpeg_source_output = fdopen(pipe_from_source.files.read_from, "r");*/
+
+    // waifu2x doesn't like using stdout
+	char* waifu2x_command[] = { "th", "./waifu2x.lua", "-m", "scale",  "-i", input_frame->absolute_filename, "-o", output_frame->absolute_filename, NULL };
 	char* waifu2x_location = "./waifu2x/";
 	
 	while(1){
 		// Read PNG
-		if (expandable_buffer_read_png_in(&buffer, ffmpeg_pipein) != 0) break;
+		if (expandable_buffer_read_png_in(&buffer, ffmpeg_source_output) != 0) break;
 			
 		fprintf(stdout, "Read a PNG file of size %zu, buffer capacity is %zu\n", buffer.size, buffer.capacity);
 
-		expandable_buffer_write_to_file(&buffer, frame_file);
-		fflush(frame_file);
+		expandable_buffer_write_to_file(&buffer, input_frame->file);
+		// Push the changes to the file
+		fflush(input_frame->file);
 
 		{
-			// Start waifu2x
-			pipe_data pipe_from_waifu2x = create_pipe_data();
-			int waifu2x_process_pid = run_command(&pipe_from_waifu2x, waifu2x_command, waifu2x_location);
-			pipe_data_close_write_to(&pipe_from_waifu2x);
-
-			fprintf(stdout, "WAIFU PID %d\n", waifu2x_process_pid);
+			// Wait for waifu2x
+			pid_t waifu2x_process_pid = run_command(waifu2x_command, waifu2x_location, NULL, NULL);
 			waitpid(waifu2x_process_pid, NULL, 0);
-
-			FILE *waifu2x_pipein = fdopen(pipe_from_source.files.read_from, "r");
-
-			// Read the png in
-			expandable_buffer_clear(&buffer);
-			if (expandable_buffer_read_png_in(&buffer, waifu2x_pipein) != 0) break;
-			fprintf(stdout, "Read a PNG file from waifu2x of size %zu, buffer capacity is %zu\n", buffer.size, buffer.capacity);
-			expandable_buffer_write_to_file(&buffer, output_file);
-			if (expandable_buffer_read_png_in(&buffer, waifu2x_pipein) != 0){
-				fprintf(stderr, "Failed to read another png in from waifu2x\n");
-			}
-						fprintf(stdout, "Read a PNG file from waifu2x of size %zu, buffer capacity is %zu\n", buffer.size, buffer.capacity);
-
-			if (expandable_buffer_read_png_in(&buffer, waifu2x_pipein) != 0){
-				fprintf(stderr, "Failed to read another png in from waifu2x\n");
-			}
-						fprintf(stdout, "Read a PNG file from waifu2x of size %zu, buffer capacity is %zu\n", buffer.size, buffer.capacity);
-
-			// Stop waifu2x once done
-			kill(waifu2x_process_pid, SIGINT);
-			pipe_data_close(&pipe_from_waifu2x);
-		}
-
-			
+		}	
 		break;
 	}
 
-	fclose(output_file);
-
 	free_expandable_buffer(&buffer);
 	// Flush and close input and output pipes
-    fflush(ffmpeg_pipein);
-    fclose(ffmpeg_pipein);
+    fflush(ffmpeg_source_output);
+    fclose(ffmpeg_source_output);
 	// Send SIGINT to the process so ffmpeg can clean up its control characters
-	kill(ffmpeg_input_process_pid, SIGINT);
-	pipe_data_close(&pipe_from_source);
+	kill(ffmpeg_source_pid, SIGINT);
+	waitpid(ffmpeg_source_pid, NULL, 0);
+	pipe_data_close(&ffmpeg_source_output_pipe);
     //fflush(pipeout);
     //pclose(pipeout);
-	// The temp file will automatically be destroyed once unlinked
-	//unlink(frame_filename);
-	fclose(frame_file);
+	free_temp_file(&input_frame);
+	free_temp_file(&output_frame);
 }
