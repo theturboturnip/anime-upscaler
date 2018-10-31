@@ -1,0 +1,50 @@
+#!/bin/bash
+
+function install_pkg() {
+	sudo apt-get install $1
+}
+
+function install_pkg_if_nonexistant() {
+	# Checks if the given package is installed, installs it if not
+	dpkg -l $1 &> /dev/null || {
+		echo "Package $1 not found, attempting install..."
+		install_pkg $1
+	}
+}
+
+ls /usr/local/cuda &> /dev/null || {
+	echo "CUDA not found, attempting install..."
+	install_pkg cuda || {
+		echo "Please install it using the instructions here: https://developer.nvidia.com/cuda-downloads"
+		exit 1
+	}
+}
+
+install_pkg_if_nonexistant libsnappy-dev
+install_pkg_if_nonexistant libgraphicsmagick1-dev
+
+
+function luarocks(){
+	$(which luarocks) $@
+}
+function sudo_luarocks(){
+	sudo $(which luarocks) $@
+}
+
+install_pkg_if_nonexistant luarocks
+function install_luarock() {
+	luarocks show $1 &> /dev/null || {
+		echo "Luarocks package $1 not found, installing..."
+		sudo_luarocks install $1
+	}
+}
+install_luarock graphicsmagick # upgrade
+install_luarock lua-csnappy
+install_luarock md5
+install_luarock uuid
+install_luarock csvigo
+# if you need to use cuDNN library. cuDNN is required.
+install_luarock torch
+install_luarock nn
+install_luarock cutorch
+install_luarock cudnn
