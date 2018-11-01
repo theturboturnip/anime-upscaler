@@ -1,4 +1,4 @@
-build: anime_upscaler.c
+build: anime_upscaler.c expandable_buffer.h
 	cc -O3 -Werror -Wall -Wno-unused-variable anime_upscaler.c -o anime_upscaler
 
 clean:
