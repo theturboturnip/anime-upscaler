@@ -146,52 +146,56 @@ int main(int argc, char* argv[]){
 	dup2(dev_null_read, ffmpeg_source_input_pipe.files.write_to); // Send /dev/null to the input so that it doesn't use the terminal
 	pipe_data_close_read_from(&ffmpeg_source_input_pipe); // We shouldn't be able to read from the input
 	pipe_data_close_write_to(&ffmpeg_source_output_pipe); // We shouldn't be able to write to the output
-    //FILE *ffmpeg_source_output = fdopen(ffmpeg_source_output_pipe.files.read_from, "r"); // Open the output as a pipe so we can read it
+    FILE *ffmpeg_source_output = fdopen(ffmpeg_source_output_pipe.files.read_from, "r"); // Open the output as a pipe so we can read it
 
 	/*
 	  Set up the ffmpeg result daemon
 	*/
-	//pipe_data ffmpeg_result_input_pipe = create_pipe_data();
+	pipe_data ffmpeg_result_input_pipe = create_pipe_data();
 	//pipe_data ffmpeg_result_output_pipe = create_pipe_data();
 	char* ffmpeg_result_command[] = { "ffmpeg", "-y",
-									  //"-i", input_filepath,
+									  "-i", input_filepath,
+									  //"-vsync", "drop",
+									  //"-r", "25",
 									  "-vcodec", "png", "-f", "image2pipe", "-i", "-",
-									  //"-r", "1/1",//"-f", "matroska", //"-c:v", "libx264", //"-c:a", "copy", "-map", "1:v:0", "-map", "0:a:0", 
+									  "-c:a", "copy", "-map", "1:v:0", "-map", "0:a:0", 
 									  output_filepath,
 									  NULL };
 	char* echo_stdin_command[] = { "cat" };
-	pid_t ffmpeg_result_pid = run_command(ffmpeg_result_command, NULL, &ffmpeg_source_output_pipe, NULL, 0);//&ffmpeg_result_output_pipe);
+	pid_t ffmpeg_result_pid = run_command(ffmpeg_result_command, NULL, &ffmpeg_result_input_pipe, NULL, 0);//&ffmpeg_result_output_pipe);
 
-	//FILE *ffmpeg_result_input = fdopen(ffmpeg_result_input_pipe.files.write_to, "w"); // Open the input as a pipe so we can put images in it
-	//pipe_data_close_read_from(&ffmpeg_result_input_pipe); // We shouldn't be able to read from the input
+	FILE *ffmpeg_result_input = fdopen(ffmpeg_result_input_pipe.files.write_to, "w"); // Open the input as a pipe so we can put images in it
+	pipe_data_close_read_from(&ffmpeg_result_input_pipe); // We shouldn't be able to read from the input
 	//pipe_data_close_write_to(&ffmpeg_result_output_pipe); // We shouldn't be able to write to the output
 	//dup2(dev_null_write, ffmpeg_result_output_pipe.files.read_from); // Send the output to /dev/null because we don't care about it
 
 
     // waifu2x doesn't like using stdout
+	// TODO: Forcing cudnn makes it fail
 	char* waifu2x_command[] = { "th", "./waifu2x.lua", "-m", "scale",  "-i", input_frame->absolute_filename, "-o", output_frame->absolute_filename, NULL };
 	char* waifu2x_location = "./waifu2x/";
 
-	/*int current_frame = 0;
+	int current_frame = 0;
 	size_t last_output_frame_size = 0;
 	while(1){
 		// Read PNG
 		//fprintf(stderr, "Reading frame %d from input \n", current_frame);
 		if (expandable_buffer_read_png_in(&buffer, ffmpeg_source_output) != 0) break;
-
+		//expandable_buffer_print_last_n_bytes(&buffer, 12);
+			
 		expandable_buffer_write_to_file(&buffer, input_frame->file);
 		// Push the changes to the file
 		fflush(input_frame->file);
 
-		// TODO: If this is enabled the same frame is sent to ffmpeg each time
-		if (0){
+		if (1){
 			// Wait for waifu2x
 			//pipe_data waifu2x_output_pipe = create_pipe_data();
 			
-			pid_t waifu2x_process_pid = run_command(waifu2x_command, waifu2x_location, NULL, NULL, 1);
+			pid_t waifu2x_process_pid = run_command(waifu2x_command, waifu2x_location, NULL, NULL, 0);
 			//pipe_data_close_write_to(&waifu2x_output_pipe); // We shouldn't be able to write to the output
 			//dup2(dev_null_write, waifu2x_output_pipe.files.read_from); // Send the output to /dev/null because we don't care about it
-			waitpid(waifu2x_process_pid, NULL, 0);
+			waitid(P_PID, waifu2x_process_pid, NULL, WSTOPPED|WEXITED);
+				//waitpid(waifu2x_process_pid, NULL, 0);
 
 			//pipe_data_close(&waifu2x_output_pipe);
 
@@ -199,42 +203,50 @@ int main(int argc, char* argv[]){
 			//clearerr(output_frame->file);
 			//sleep(1);
 			reopen_temp_file(output_frame, "rb");
+			//FILE* new_temp_file_open = fopen(output_frame->absolute_filename, "rb");
 			expandable_buffer_read_png_in(&buffer, output_frame->file);
+			//fclose(new_temp_file_open);
+		}else{
+			FILE* new_temp_file_open = fopen(input_frame->absolute_filename, "rb");
+			expandable_buffer_read_png_in(&buffer, new_temp_file_open);//output_frame->file);
+			fclose(new_temp_file_open);
 		}
 
-		
-		if (buffer.pointer[buffer.size-1])fprintf(stderr, "End of output file: %d\n", buffer.pointer[buffer.size-1]);
 		expandable_buffer_write_to_pipe(&buffer, ffmpeg_result_input);
-		last_output_frame_size = buffer.size;
-		fflush(stderr);
+
+		
+		//if (buffer.pointer[buffer.size-1])fprintf(stderr, "End of output file: %d\n", buffer.pointer[buffer.size-1]);
+		//last_output_frame_size = buffer.size;
+		//fflush(stderr);
 		//break;
 	}
-	fprintf(stderr, "\n");
+	//expandable_buffer_clear(&buffer);
+	//expandable_buffer_push_file_end(&buffer);
+	//expandable_buffer_write_to_pipe(&buffer, ffmpeg_result_input);
+	/*fprintf(stderr, "\n");
 	fflush(stderr);*/
 
 
 	// Send SIGINT to the process so ffmpeg can clean up its control characters
 	//kill(ffmpeg_result_pid, sadsdwdas);
-	//fflush(ffmpeg_result_input);
-    //fclose(ffmpeg_result_input);
-	//pipe_data_close(&ffmpeg_result_input_pipe);
+	fflush(ffmpeg_result_input);
+    fclose(ffmpeg_result_input);
 	if (waitid(P_PID, ffmpeg_result_pid, NULL, WSTOPPED|WEXITED) != 0){
 		fprintf(stderr, "Error waiting for PID %d %s\n", ffmpeg_result_pid, strerror(errno));
 	}
-	
+	pipe_data_close(&ffmpeg_result_input_pipe);
+	//pipe_data_close(&ffmpeg_result_output_pipe);
+
 	free_expandable_buffer(&buffer);
 	// Flush and close input and output pipes
-    //fflush(ffmpeg_source_output);
-    //fclose(ffmpeg_source_output);
+    fflush(ffmpeg_source_output);
+    fclose(ffmpeg_source_output);
 	
 	// Send SIGINT to the process so ffmpeg can clean up its control characters
 	kill(ffmpeg_source_pid, SIGINT);
 	waitpid(ffmpeg_source_pid, NULL, 0);
 	pipe_data_close(&ffmpeg_source_input_pipe);
 	pipe_data_close(&ffmpeg_source_output_pipe);
-
-
-	//pipe_data_close(&ffmpeg_result_output_pipe);
 
 	free_temp_file(&input_frame);
 	free_temp_file(&output_frame);

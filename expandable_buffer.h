@@ -51,6 +51,11 @@ int expandable_buffer_read_data_in(expandable_buffer* buffer, FILE* in, size_t s
 	return fread(data_start, 1, size, in);
 }
 
+void expandable_buffer_push_file_end(expandable_buffer* buffer){
+	BYTE* data_start = expandable_buffer_increase_size(buffer, 1);
+	*data_start = '\0';
+}
+
 // Reads one PNG data from the file to the buffer
 // returns 1 if unsuccessful
 int expandable_buffer_read_png_in(expandable_buffer* buffer, FILE* in){
@@ -115,30 +120,35 @@ int expandable_buffer_read_png_in(expandable_buffer* buffer, FILE* in){
 		//fprintf(stderr, "%d ", CRC);
 	} while(strncmp(chunk_name, END_BLOCK_NAME, END_BLOCK_NAME_LENGTH) != 0);
 	//fprintf(stderr, "\n");
+
+	// This breaks ffmpeg
+	//expandable_buffer_push_file_end(buffer);
 	
 	return 0;
 }
 
 int expandable_buffer_write_to_file(expandable_buffer* buffer, FILE* out){
+	fflush(out);
 	if (ftruncate(fileno(out), buffer->size) != 0){
-		fprintf(stderr, "Error truncation the output file\n");
+		fprintf(stderr, "Error truncating the output file\n");
 		return 1;
 	}
 
+	// Somehow truncating the 
+	rewind(out);
 	fwrite(buffer->pointer, sizeof(buffer->pointer[0]), buffer->size, out);
+	fflush(out);
 	
 	return 0;
 }
 void expandable_buffer_write_to_pipe(expandable_buffer* buffer, FILE* out){
 	BYTE* pointer = buffer->pointer;
 	size_t size_left = buffer->size;
-	do {
+	while(size_left > 0) {
 		size_t total_written = fwrite(pointer, sizeof(pointer[0]), size_left, out);
 		pointer += total_written;
 		size_left -= total_written;
-	}while(size_left > 0);
-	//char zero = '\0';
-	//fwrite(&zero, sizeof(char), 1, out);
+	}
 }
 
 void expandable_buffer_print(expandable_buffer* buffer){
@@ -149,6 +159,18 @@ void expandable_buffer_print(expandable_buffer* buffer){
 	int i = 0;
 	for (i = 0; i < buffer->size && i < 12; i++){
 		sprintf(number, "%02x", buffer->pointer[i]);
+		fprintf(stdout, "%s ", number);
+	}
+	fprintf(stdout, "\n");
+}
+void expandable_buffer_print_last_n_bytes(expandable_buffer* buffer, size_t n){
+	fprintf(stdout, "Buffer(s = %zu) End: ", buffer->size);
+	size_t start_index = buffer->size - n;
+	if (start_index > buffer->size) start_index = 0; // If it overflowed, reset it 
+	char number[3] = {'\0'};
+	size_t i;
+	for (i = 0; i < n && (i + start_index) < buffer->size; i++){
+		sprintf(number, "%02x", buffer->pointer[start_index + i]);
 		fprintf(stdout, "%s ", number);
 	}
 	fprintf(stdout, "\n");
