@@ -257,22 +257,18 @@ int main(int argc, char* argv[]){
 	//expandable_buffer_print(&buffer);
 
 	temp_file* input_frame = create_temp_file("wb");
-	/*char input_frame_filename[] = "anime-upscaler-tempfile-XXXXXX.png";
-	int frame_file_descriptor = mkstemp(frame_filename);
-	if (frame_file_descriptor == -1){
-		fprintf(stderr, "Failed to create temp file\n");
-		return 1;
-	}
-	char input_frame_filename_absolute[PATH_MAX];
-	realpath(input_frame_filename, input_frame_filename_absolute);
-	FILE* input_frame_file = fdopen(frame_file_descriptor, "wb");*/
-
 	temp_file* output_frame = create_temp_file("rb");
 
+	int dev_null = open("/dev/null", O_RDONLY);
+
+	// TODO Pipe ffmpeg.stdin to devnull
 	// Set up the ffmpeg source daemon
+	pipe_data ffmpeg_source_input_pipe = create_pipe_data();
 	pipe_data ffmpeg_source_output_pipe = create_pipe_data();
 	char* ffmpeg_source_command[] = { "ffmpeg", "-y", "-i", "small.mp4", "-vcodec", "png", "-f", "image2pipe", "-", NULL };
-	pid_t ffmpeg_source_pid = run_command(ffmpeg_source_command, NULL, NULL, &ffmpeg_source_output_pipe);
+	pid_t ffmpeg_source_pid = run_command(ffmpeg_source_command, NULL, &ffmpeg_source_input_pipe, &ffmpeg_source_output_pipe);
+	pipe_data_close_read_from(&ffmpeg_source_input_pipe); // We shouldn't be able to write to the output
+	dup2(dev_null, ffmpeg_source_input_pipe.files.write_to);
 	pipe_data_close_write_to(&ffmpeg_source_output_pipe); // We shouldn't be able to write to the output
 	// Open the ffmpeg pipe output as a file
     FILE *ffmpeg_source_output = fdopen(ffmpeg_source_output_pipe.files.read_from, "r");
