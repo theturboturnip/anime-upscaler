@@ -136,6 +136,9 @@ int expandable_buffer_write_to_file(expandable_buffer* buffer, FILE* out){
 	
 	return 0;
 }
+void expandable_buffer_write_to_pipe(expandable_buffer* buffer, FILE* out){
+	fwrite(buffer->pointer, sizeof(buffer->pointer[0]), buffer->size, out);
+}
 
 void expandable_buffer_print(expandable_buffer* buffer){
 	fprintf(stdout, "Buffer Pointer: %p\nBuffer Size: %zu\nBuffer Capacity: %zu\n", buffer->pointer, buffer->size, buffer->capacity);
@@ -191,7 +194,7 @@ int run_command(char* const command[], char* working_directory, pipe_data* input
 			// Redirect stdin
 			if (dup2(input_pipe->files.read_from, 0) < 0){
 				pipe_data_close_read_from(input_pipe);
-				fprintf(stderr, "Failed to redirect input for command\n");
+				fprintf(stderr, "Failed to redirect input for command %s\n", command[0]);
 				exit(1);
 			}
 			pipe_data_close_write_to(input_pipe); // We don't need this anymore
@@ -200,10 +203,9 @@ int run_command(char* const command[], char* working_directory, pipe_data* input
 			// Redirect stdout
 			if (dup2(output_pipe->files.write_to, 1) < 0){
 				pipe_data_close_write_to(output_pipe);
-				fprintf(stderr, "Failed to redirect output for command\n");
+				fprintf(stderr, "Failed to redirect output for command %s\n", command[0]);
 				exit(1);
 			}
-			fprintf(stderr, "Redirected output for command\n");
 			pipe_data_close_read_from(output_pipe); // We don't need this anymore
 		}
 		// Redirect stderr to /dev/null
@@ -248,10 +250,13 @@ void free_temp_file(temp_file** tfile_pointer){
 }
 
 int main(int argc, char* argv[]){
-	/*if (argc == 1){
-	  fprintf(stderr, "Not enough arguments!\n");
-	  return 1;
-	  }*/
+	if (argc < 3){
+		fprintf(stderr, "Usage: %s [input_file] [output_file]\n", argv[0]);
+		return 1;
+	}
+
+	char* input_filepath = argv[1];
+	char* output_filepath = argv[2];
 	
 	expandable_buffer buffer = create_expandable_buffer(initial_buffer_size);
 	//expandable_buffer_print(&buffer);
@@ -259,36 +264,53 @@ int main(int argc, char* argv[]){
 	temp_file* input_frame = create_temp_file("wb");
 	temp_file* output_frame = create_temp_file("rb");
 
-	int dev_null = open("/dev/null", O_RDONLY);
+	int dev_null_read = open("/dev/null", O_RDONLY);
+	int dev_null_write = open("/dev/null", O_WRONLY);
 
-	// TODO Pipe ffmpeg.stdin to devnull
-	// Set up the ffmpeg source daemon
+	/*
+	  Set up the ffmpeg source daemon
+	*/
 	pipe_data ffmpeg_source_input_pipe = create_pipe_data();
 	pipe_data ffmpeg_source_output_pipe = create_pipe_data();
-	char* ffmpeg_source_command[] = { "ffmpeg", "-y", "-i", "small.mp4", "-vcodec", "png", "-f", "image2pipe", "-", NULL };
+	char* ffmpeg_source_command[] = { "ffmpeg", "-y",
+									  "-i", input_filepath,
+									  "-vcodec", "png", "-f", "image2pipe", "-",
+									  NULL };
 	pid_t ffmpeg_source_pid = run_command(ffmpeg_source_command, NULL, &ffmpeg_source_input_pipe, &ffmpeg_source_output_pipe);
-	pipe_data_close_read_from(&ffmpeg_source_input_pipe); // We shouldn't be able to write to the output
-	dup2(dev_null, ffmpeg_source_input_pipe.files.write_to);
-	pipe_data_close_write_to(&ffmpeg_source_output_pipe); // We shouldn't be able to write to the output
-	// Open the ffmpeg pipe output as a file
-    FILE *ffmpeg_source_output = fdopen(ffmpeg_source_output_pipe.files.read_from, "r");
 
-	/*pipe_data ffmpeg_source_input_pipe = create_pipe_data();
-	char* ffmpeg_source_command[] = { "ffmpeg", "-y", "-vcodec", "png", "-f", "image2pipe" "-i", "-", NULL };
-	pid_t ffmpeg_source_pid = run_command(&pipe_from_source, ffmpeg_command, NULL);
+	dup2(dev_null_read, ffmpeg_source_input_pipe.files.write_to); // Send /dev/null to the input so that it doesn't use the terminal
+	pipe_data_close_read_from(&ffmpeg_source_input_pipe); // We shouldn't be able to read from the input
 	pipe_data_close_write_to(&ffmpeg_source_output_pipe); // We shouldn't be able to write to the output
-	// Open the ffmpeg pipe output as a file
-    FILE *ffmpeg_source_output = fdopen(pipe_from_source.files.read_from, "r");*/
+    FILE *ffmpeg_source_output = fdopen(ffmpeg_source_output_pipe.files.read_from, "r"); // Open the output as a pipe so we can read it
+
+	/*
+	  Set up the ffmpeg result daemon
+	*/
+	pipe_data ffmpeg_result_input_pipe = create_pipe_data();
+	pipe_data ffmpeg_result_output_pipe = create_pipe_data();
+	char* ffmpeg_result_command[] = { "ffmpeg", "-y",
+									  "-i", input_filepath,
+									  "-vcodec", "png", "-f", "image2pipe", "-i", "-",
+									  "-c:v", "libx264", "-c:a", "copy", "-map", "1:v:0", "-map", "0:a:0", 
+									  output_filepath,
+									  NULL };
+	pid_t ffmpeg_result_pid = run_command(ffmpeg_result_command, NULL, &ffmpeg_result_input_pipe, &ffmpeg_result_output_pipe);
+
+	FILE *ffmpeg_result_input = fdopen(ffmpeg_result_input_pipe.files.write_to, "w"); // Open the input as a pipe so we can put images in it
+	pipe_data_close_read_from(&ffmpeg_result_input_pipe); // We shouldn't be able to read from the input
+	pipe_data_close_write_to(&ffmpeg_result_output_pipe); // We shouldn't be able to write to the output
+	dup2(dev_null_write, ffmpeg_result_output_pipe.files.read_from); // Send the output to /dev/null because we don't care about it
+
 
     // waifu2x doesn't like using stdout
 	char* waifu2x_command[] = { "th", "./waifu2x.lua", "-m", "scale",  "-i", input_frame->absolute_filename, "-o", output_frame->absolute_filename, NULL };
 	char* waifu2x_location = "./waifu2x/";
-	
+
+	int current_frame = 0;
 	while(1){
 		// Read PNG
+		fprintf(stderr, "Reading frame %d from input \r", current_frame);
 		if (expandable_buffer_read_png_in(&buffer, ffmpeg_source_output) != 0) break;
-			
-		fprintf(stdout, "Read a PNG file of size %zu, buffer capacity is %zu\n", buffer.size, buffer.capacity);
 
 		expandable_buffer_write_to_file(&buffer, input_frame->file);
 		// Push the changes to the file
@@ -296,22 +318,42 @@ int main(int argc, char* argv[]){
 
 		{
 			// Wait for waifu2x
+			//pipe_data waifu2x_output_pipe = create_pipe_data();
+			
 			pid_t waifu2x_process_pid = run_command(waifu2x_command, waifu2x_location, NULL, NULL);
+			//pipe_data_close_write_to(&waifu2x_output_pipe); // We shouldn't be able to write to the output
+			//dup2(dev_null_write, waifu2x_output_pipe.files.read_from); // Send the output to /dev/null because we don't care about it
 			waitpid(waifu2x_process_pid, NULL, 0);
-		}	
-		break;
+
+			//pipe_data_close(&waifu2x_output_pipe);
+		}
+
+		fprintf(stderr, "Reading frame %d from output\r", current_frame++);
+		fseek(output_frame->file, 0, SEEK_SET);
+		expandable_buffer_read_png_in(&buffer, output_frame->file);
+		expandable_buffer_write_to_pipe(&buffer, ffmpeg_result_input);
+		
+		//break;
 	}
+	fprintf(stderr, "\n");
 
 	free_expandable_buffer(&buffer);
 	// Flush and close input and output pipes
     fflush(ffmpeg_source_output);
     fclose(ffmpeg_source_output);
+	fflush(ffmpeg_result_input);
+    fclose(ffmpeg_result_input);
 	// Send SIGINT to the process so ffmpeg can clean up its control characters
 	kill(ffmpeg_source_pid, SIGINT);
 	waitpid(ffmpeg_source_pid, NULL, 0);
+	pipe_data_close(&ffmpeg_source_input_pipe);
 	pipe_data_close(&ffmpeg_source_output_pipe);
-    //fflush(pipeout);
-    //pclose(pipeout);
+	// Send SIGINT to the process so ffmpeg can clean up its control characters
+	kill(ffmpeg_result_pid, SIGINT);
+	waitpid(ffmpeg_result_pid, NULL, 0);
+	pipe_data_close(&ffmpeg_result_input_pipe);
+	pipe_data_close(&ffmpeg_result_output_pipe);
+
 	free_temp_file(&input_frame);
 	free_temp_file(&output_frame);
 }
