@@ -134,7 +134,6 @@ int expandable_buffer_write_to_file(expandable_buffer* buffer, FILE* out){
 		return 1;
 	}
 
-	// Somehow truncating the 
 	rewind(out);
 	fwrite(buffer->pointer, sizeof(buffer->pointer[0]), buffer->size, out);
 	fflush(out);

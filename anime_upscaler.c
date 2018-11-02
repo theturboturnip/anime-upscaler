@@ -12,8 +12,6 @@
 
 #include "expandable_buffer.h"
 
-const size_t initial_buffer_size = 64;
-
 typedef union {
 	int array[2];
 	struct {
@@ -113,6 +111,36 @@ void reopen_temp_file(temp_file* tfile, char* access_type){
 	tfile->file = freopen(tfile->absolute_filename, access_type, tfile->file);
 }
 
+// Use waifu2x to upscale 16 images per round
+#define FRAMES_PER_UPSCALE_ROUND 1
+#define INITIAL_FRAME_BUFFER_SIZE 64
+
+typedef struct {
+	expandable_buffer buffer;
+	temp_file* file;
+} temp_frame;
+temp_frame create_temp_frame(){
+	temp_frame frame;
+	frame.buffer = create_expandable_buffer(INITIAL_FRAME_BUFFER_SIZE);
+	frame.file = create_temp_file("wb+");
+	return frame;
+}
+void free_temp_frame(temp_frame* frame){
+	free_temp_file(&frame->file);
+}
+
+typedef struct {
+	int pid;
+	pipe_data input_pipe;
+} waifu2x_process_data;
+
+static volatile sig_atomic_t should_stop = 0;
+
+void SIGINT_handler(int sig){
+	signal(sig, SIG_IGN);
+	should_stop = 1;
+}
+
 int main(int argc, char* argv[]){
 	if (argc < 3){
 		fprintf(stderr, "Usage: %s [input_file] [output_file]\n", argv[0]);
@@ -121,12 +149,6 @@ int main(int argc, char* argv[]){
 
 	char* input_filepath = argv[1];
 	char* output_filepath = argv[2];
-	
-	expandable_buffer buffer = create_expandable_buffer(initial_buffer_size);
-	//expandable_buffer_print(&buffer);
-
-	temp_file* input_frame = create_temp_file("wb");
-	temp_file* output_frame = create_temp_file("rb");
 
 	int dev_null_read = open("/dev/null", O_RDONLY);
 	int dev_null_write = open("/dev/null", O_WRONLY);
@@ -162,70 +184,99 @@ int main(int argc, char* argv[]){
 									  output_filepath,
 									  NULL };
 	char* echo_stdin_command[] = { "cat" };
-	pid_t ffmpeg_result_pid = run_command(ffmpeg_result_command, NULL, &ffmpeg_result_input_pipe, NULL, 0);//&ffmpeg_result_output_pipe);
+	pid_t ffmpeg_result_pid = run_command(ffmpeg_result_command, NULL, &ffmpeg_result_input_pipe, NULL, 1);//&ffmpeg_result_output_pipe);
 
 	FILE *ffmpeg_result_input = fdopen(ffmpeg_result_input_pipe.files.write_to, "w"); // Open the input as a pipe so we can put images in it
 	pipe_data_close_read_from(&ffmpeg_result_input_pipe); // We shouldn't be able to read from the input
 	//pipe_data_close_write_to(&ffmpeg_result_output_pipe); // We shouldn't be able to write to the output
 	//dup2(dev_null_write, ffmpeg_result_output_pipe.files.read_from); // Send the output to /dev/null because we don't care about it
 
-
+	// Set upu the interrupt handles
+	struct sigaction sigint_action;
+	sigint_action.sa_handler = SIGINT_handler;
+	sigaction(SIGINT, &sigint_action, NULL);
+	sigaction(SIGQUIT, &sigint_action, NULL);
+	
+	// Set up the temp files AFTER the interrupt handler is set
+	// If someone Ctrl-C's before this, we'll die right away
+	// If someone Ctrl-C's after this, we'll get rid of the tempfiles properly
+	temp_frame temp_frames[FRAMES_PER_UPSCALE_ROUND];
+	{
+		int i;
+		for (i = 0; i < FRAMES_PER_UPSCALE_ROUND; i++) temp_frames[i] = create_temp_frame();
+	}
+	
     // waifu2x doesn't like using stdout
 	// TODO: Forcing cudnn makes it fail
 	//char* waifu2x_command[] = { "th", "./waifu2x.lua", "-m", "scale",  "-i", input_frame->absolute_filename, "-o", output_frame->absolute_filename, NULL };
-	char* waifu2x_command[] = { "th", "./waifu2x.lua", "-m", "scale",  "-i", "/dev/stdin", "-o", output_frame->absolute_filename, NULL };
+	char* waifu2x_command[] = { "th", "./waifu2x.lua",
+								"-m", "scale",
+								"-l", "/dev/stdin",
+								"-o", "%s.png", // Ideally this will output to the old input
+								NULL };
+	const size_t waifu2x_command_output_file_index = 7; 
 	char* waifu2x_location = "./waifu2x/";
-
+	waifu2x_process_data waifu2x_process;
+	
 	int current_frame = 0;
 	size_t last_output_frame_size = 0;
-	while(1){
-		// Read PNG
-		//fprintf(stderr, "Reading frame %d from input \n", current_frame);
-		if (expandable_buffer_read_png_in(&buffer, ffmpeg_source_output) != 0) break;
-		//expandable_buffer_print_last_n_bytes(&buffer, 12);
+	while(should_stop == 0){
+		int frameInputIndex;
+		for (frameInputIndex = 0; frameInputIndex < FRAMES_PER_UPSCALE_ROUND; frameInputIndex++){
+			temp_frame* frame = &temp_frames[frameInputIndex];
+			// Read the PNG from ffmpeg
+			if (expandable_buffer_read_png_in(&frame->buffer, ffmpeg_source_output) != 0)
+				break;
+			// Write it out 
+			expandable_buffer_write_to_file(&frame->buffer, frame->file->file);
+			fflush(frame->file->file);
+		}
+		if (frameInputIndex == 0) break; // If no PNG files were read, then stop
+
+		int total_frames_this_round = frameInputIndex;
+
+		// Wait for waifu2x
+		//pipe_data waifu2x_output_pipe = create_pipe_data();
+		waifu2x_process.input_pipe = create_pipe_data();
+		FILE* waifu2x_input_file = fdopen(waifu2x_process.input_pipe.files.write_to, "wb");
 			
-		//expandable_buffer_write_to_file(&buffer, input_frame->file);
-		// Push the changes to the file
-		//fflush(input_frame->file);
-
-		if (1){
-			// Wait for waifu2x
-			//pipe_data waifu2x_output_pipe = create_pipe_data();
-			pipe_data waifu2x_input_pipe = create_pipe_data();
-			FILE* waifu2x_input_file = fdopen(waifu2x_input_pipe.files.write_to, "wb");
+		waifu2x_process.pid = run_command(waifu2x_command, waifu2x_location, &waifu2x_process.input_pipe, NULL, 0);
+		pipe_data_close_read_from(&waifu2x_process.input_pipe);
+		
+		int frame_output_index;
+		for (frame_output_index = 0; frame_output_index < total_frames_this_round; frame_output_index++){
+			temp_frame* frame = &temp_frames[frame_output_index];
 			
-			pid_t waifu2x_process_pid = run_command(waifu2x_command, waifu2x_location, &waifu2x_input_pipe, NULL, 0);
-			pipe_data_close_read_from(&waifu2x_input_pipe);
-			expandable_buffer_write_to_pipe(&buffer, waifu2x_input_file);
-			fflush(waifu2x_input_file);
-			fclose(waifu2x_input_file);
-			//pipe_data_close_write_to(&waifu2x_output_pipe); // We shouldn't be able to write to the output
-			//dup2(dev_null_write, waifu2x_output_pipe.files.read_from); // Send the output to /dev/null because we don't care about it
-			waitid(P_PID, waifu2x_process_pid, NULL, WSTOPPED|WEXITED);
-				//waitpid(waifu2x_process_pid, NULL, 0);
-
-			//pipe_data_close(&waifu2x_output_pipe);
-
-			//fprintf(stderr, "Reading frame %d from output\n", current_frame++);
-			//clearerr(output_frame->file);
-			//sleep(1);
-			reopen_temp_file(output_frame, "rb");
-			//FILE* new_temp_file_open = fopen(output_frame->absolute_filename, "rb");
-			expandable_buffer_read_png_in(&buffer, output_frame->file);
-			//fclose(new_temp_file_open);
-		}else{
-			FILE* new_temp_file_open = fopen(input_frame->absolute_filename, "rb");
-			expandable_buffer_read_png_in(&buffer, new_temp_file_open);//output_frame->file);
-			fclose(new_temp_file_open);
+			//expandable_buffer_write_to_pipe(&frame->buffer, waifu2x_input_file);
+			char* str = frame->file->absolute_filename;
+			fwrite(str, sizeof(*str), strlen(str), waifu2x_input_file);
+			fputc('\n', waifu2x_input_file);	
+		}
+		fflush(waifu2x_input_file);
+		fclose(waifu2x_input_file);	
+		
+//pipe_data_close_write_to(&waifu2x_output_pipe); // We shouldn't be able to write to the output
+		//dup2(dev_null_write, waifu2x_output_pipe.files.read_from); // Send the output to /dev/null because we don't care about it
+		//fprintf(stderr, "Waiting for waifu\n");
+		waitid(P_PID, waifu2x_process.pid, NULL, WSTOPPED|WEXITED);
+		//waitpid(waifu2x_process_pid, NULL, 0);	
+		//pipe_data_close(&waifu2x_output_pipe);
+		pipe_data_close(&waifu2x_process.input_pipe);
+		
+		//reopen_temp_file(output_frame, "rb");
+		for (frame_output_index = 0; frame_output_index < total_frames_this_round; frame_output_index++){
+			temp_frame* frame = &temp_frames[frame_output_index];
+			expandable_buffer_read_png_in(&frame->buffer, frame->file->file);
+			expandable_buffer_write_to_pipe(&frame->buffer, ffmpeg_result_input);
 		}
 
-		expandable_buffer_write_to_pipe(&buffer, ffmpeg_result_input);
-
+		///raise(SIGINT);
 		
 		//if (buffer.pointer[buffer.size-1])fprintf(stderr, "End of output file: %d\n", buffer.pointer[buffer.size-1]);
 		//last_output_frame_size = buffer.size;
 		//fflush(stderr);
 		//break;
+		if (should_stop != 0) fprintf(stderr, "got sigint\n");
 	}
 	//expandable_buffer_clear(&buffer);
 	//expandable_buffer_push_file_end(&buffer);
@@ -234,8 +285,7 @@ int main(int argc, char* argv[]){
 	fflush(stderr);*/
 
 
-	// Send SIGINT to the process so ffmpeg can clean up its control characters
-	//kill(ffmpeg_result_pid, sadsdwdas);
+	// Wait for the FFMpeg result process to finish
 	fflush(ffmpeg_result_input);
     fclose(ffmpeg_result_input);
 	if (waitid(P_PID, ffmpeg_result_pid, NULL, WSTOPPED|WEXITED) != 0){
@@ -244,17 +294,20 @@ int main(int argc, char* argv[]){
 	pipe_data_close(&ffmpeg_result_input_pipe);
 	//pipe_data_close(&ffmpeg_result_output_pipe);
 
-	free_expandable_buffer(&buffer);
+	/*
+	  Close FFMpeg source process
+	*/
 	// Flush and close input and output pipes
     fflush(ffmpeg_source_output);
     fclose(ffmpeg_source_output);
-	
 	// Send SIGINT to the process so ffmpeg can clean up its control characters
 	kill(ffmpeg_source_pid, SIGINT);
 	waitpid(ffmpeg_source_pid, NULL, 0);
 	pipe_data_close(&ffmpeg_source_input_pipe);
 	pipe_data_close(&ffmpeg_source_output_pipe);
 
-	free_temp_file(&input_frame);
-	free_temp_file(&output_frame);
+	{
+		int i;
+		for (i = 0; i < FRAMES_PER_UPSCALE_ROUND; i++) free_temp_frame(&temp_frames[i]);
+	}
 }
