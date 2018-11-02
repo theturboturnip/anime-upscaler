@@ -172,7 +172,8 @@ int main(int argc, char* argv[]){
 
     // waifu2x doesn't like using stdout
 	// TODO: Forcing cudnn makes it fail
-	char* waifu2x_command[] = { "th", "./waifu2x.lua", "-m", "scale",  "-i", input_frame->absolute_filename, "-o", output_frame->absolute_filename, NULL };
+	//char* waifu2x_command[] = { "th", "./waifu2x.lua", "-m", "scale",  "-i", input_frame->absolute_filename, "-o", output_frame->absolute_filename, NULL };
+	char* waifu2x_command[] = { "th", "./waifu2x.lua", "-m", "scale",  "-i", "/dev/stdin", "-o", output_frame->absolute_filename, NULL };
 	char* waifu2x_location = "./waifu2x/";
 
 	int current_frame = 0;
@@ -183,15 +184,21 @@ int main(int argc, char* argv[]){
 		if (expandable_buffer_read_png_in(&buffer, ffmpeg_source_output) != 0) break;
 		//expandable_buffer_print_last_n_bytes(&buffer, 12);
 			
-		expandable_buffer_write_to_file(&buffer, input_frame->file);
+		//expandable_buffer_write_to_file(&buffer, input_frame->file);
 		// Push the changes to the file
-		fflush(input_frame->file);
+		//fflush(input_frame->file);
 
 		if (1){
 			// Wait for waifu2x
 			//pipe_data waifu2x_output_pipe = create_pipe_data();
+			pipe_data waifu2x_input_pipe = create_pipe_data();
+			FILE* waifu2x_input_file = fdopen(waifu2x_input_pipe.files.write_to, "wb");
 			
-			pid_t waifu2x_process_pid = run_command(waifu2x_command, waifu2x_location, NULL, NULL, 0);
+			pid_t waifu2x_process_pid = run_command(waifu2x_command, waifu2x_location, &waifu2x_input_pipe, NULL, 0);
+			pipe_data_close_read_from(&waifu2x_input_pipe);
+			expandable_buffer_write_to_pipe(&buffer, waifu2x_input_file);
+			fflush(waifu2x_input_file);
+			fclose(waifu2x_input_file);
 			//pipe_data_close_write_to(&waifu2x_output_pipe); // We shouldn't be able to write to the output
 			//dup2(dev_null_write, waifu2x_output_pipe.files.read_from); // Send the output to /dev/null because we don't care about it
 			waitid(P_PID, waifu2x_process_pid, NULL, WSTOPPED|WEXITED);
