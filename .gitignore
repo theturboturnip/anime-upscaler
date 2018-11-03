@@ -1,6 +1,7 @@
 *
-anime_upscaler
 !/waifu2x/*
 !anime_upscaler.c
 !Makefile
 !expandable_buffer.h
+!.gitignore
+!.gitmodules
