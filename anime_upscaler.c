@@ -88,7 +88,7 @@ typedef struct {
 	FILE* file;
 } temp_file;
 temp_file* create_temp_file(char* access_type){
-	char filename[] = "./tmp/anime-upscaler-tempfile-XXXXXX";
+	char filename[] = "/tmp/anime-upscaler-tempfile-XXXXXX";
 	int file_descriptor = mkstemp(filename);
 	if (file_descriptor == -1){
 		fprintf(stderr, "Failed to create temp file\n");
@@ -113,7 +113,7 @@ void reopen_temp_file(temp_file* tfile, char* access_type){
 }
 
 // Use waifu2x to upscale 16 images per round
-#define FRAMES_PER_UPSCALE_ROUND 128
+#define FRAMES_PER_UPSCALE_ROUND 256
 #define INITIAL_FRAME_BUFFER_SIZE 64
 
 typedef struct {
@@ -148,7 +148,7 @@ temp_frame create_temp_frame(){
 	// Open and close the file to make sure it exists
 	fclose(fopen(frame.output_filename, "wb"));
 	
-	fprintf(stdout, "temp file output name is: %s\n", frame.output_filename);
+	//fprintf(stdout, "temp file output name is: %s\n", frame.output_filename);
 	return frame;
 }
 void free_temp_frame(temp_frame* frame){
@@ -179,6 +179,25 @@ int main(int argc, char* argv[]){
 	char* input_filepath = argv[1];
 	char* output_filepath = argv[2];
 
+	/* 
+	   Get the framerate of the video
+	*/
+	pipe_data ffmpeg_framerate_output_pipe = create_pipe_data();
+	const char* ffmpeg_framerate_command_format = "ffmpeg -i %s 2>&1 | sed -n \"s/.*, \\(.*\\) fps.*/\\1/p\"";
+	const size_t ffmpeg_framerate_command_length = strlen(ffmpeg_framerate_command_format) + strlen(input_filepath) + 1;
+	char* ffmpeg_framerate_command = calloc(ffmpeg_framerate_command_length, sizeof(char));
+	snprintf(ffmpeg_framerate_command, ffmpeg_framerate_command_length, ffmpeg_framerate_command_format, input_filepath);
+	char* ffmpeg_framerate_invocation_command[] = { "bash", "-c", ffmpeg_framerate_command, NULL };
+	pid_t ffmpeg_framerate_pid = run_command(ffmpeg_framerate_invocation_command, NULL, NULL, &ffmpeg_framerate_output_pipe, 0);
+	pipe_data_close_write_to(&ffmpeg_framerate_output_pipe);
+	FILE* ffmpeg_framerate_output = fdopen(ffmpeg_framerate_output_pipe.files.read_from, "r");
+	char framerate_str[5] = { '\0' };
+	fread(framerate_str, sizeof(char), 4, ffmpeg_framerate_output);
+	fclose(ffmpeg_framerate_output);
+	pipe_data_close(&ffmpeg_framerate_output_pipe);
+	fprintf(stdout, "Framerate: %s\n", framerate_str);
+	if (strlen(framerate_str) == 0) exit(1);
+
 	int dev_null_read = open("/dev/null", O_RDONLY);
 	int dev_null_write = open("/dev/null", O_WRONLY);
 
@@ -207,9 +226,9 @@ int main(int argc, char* argv[]){
 	char* ffmpeg_result_command[] = { "ffmpeg", "-y",
 									  "-i", input_filepath,
 									  //"-vsync", "drop",
-									  //"-r", "25",
+									  "-r", framerate_str,
 									  "-vcodec", "png", "-f", "image2pipe", "-i", "-",
-									  "-c:a", "copy", "-map", "1:v:0", "-map", "0:a:0", 
+									  /*"-c:a", "copy",*/ "-map", "1:v:0", "-map", "0:a:0", 
 									  output_filepath,
 									  NULL };
 	char* echo_stdin_command[] = { "cat" };
@@ -238,7 +257,8 @@ int main(int argc, char* argv[]){
     // waifu2x doesn't like using stdout
 	// TODO: Forcing cudnn makes it fail
 	char* waifu2x_command[] = { "th", "./waifu2x.lua",
-								"-m", "scale",
+								"-force_cudnn", "1",
+								"-m", "noise_scale", "-noise_level", "1",
 								"-l", "/dev/stdin",
 								"-o", temp_frames[0].generic_output_filename, // TODO: Only do one calculation for generic_output_filename
 								NULL };
@@ -260,8 +280,11 @@ int main(int argc, char* argv[]){
 			expandable_buffer_write_to_file(&frame->buffer, frame->file->file);
 			fflush(frame->file->file);
 		}
-		if (frameInputIndex == 0) break; // If no PNG files were read, then stop
-
+		if (frameInputIndex == 0){
+			fprintf(stderr, "No pngs found\n");
+			break; // If no PNG files were read, then stop
+		}
+		
 		int total_frames_this_round = frameInputIndex;
 
 		// Wait for waifu2x
@@ -284,6 +307,7 @@ int main(int argc, char* argv[]){
 		
 		waitid(P_PID, waifu2x_process.pid, NULL, WSTOPPED|WEXITED);
 		pipe_data_close(&waifu2x_process.input_pipe);
+		fprintf(stderr, "Done waiting\n");
 		
 		for (frame_output_index = 0; frame_output_index < total_frames_this_round; frame_output_index++){
 			temp_frame* frame = &temp_frames[frame_output_index];
@@ -295,6 +319,7 @@ int main(int argc, char* argv[]){
 			}
 			fclose(output_file);
 		}
+		fprintf(stderr, "looping bvack\n");
 
 		if (should_stop != 0) fprintf(stderr, "got sigint\n");
 	}
