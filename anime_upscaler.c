@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <sys/wait.h>
 #include <sys/types.h>
+#include <libgen.h>
 
 #include "expandable_buffer.h"
 
@@ -87,7 +88,7 @@ typedef struct {
 	FILE* file;
 } temp_file;
 temp_file* create_temp_file(char* access_type){
-	char filename[] = "anime-upscaler-tempfile-XXXXXX";
+	char filename[] = "./tmp/anime-upscaler-tempfile-XXXXXX";
 	int file_descriptor = mkstemp(filename);
 	if (file_descriptor == -1){
 		fprintf(stderr, "Failed to create temp file\n");
@@ -112,21 +113,49 @@ void reopen_temp_file(temp_file* tfile, char* access_type){
 }
 
 // Use waifu2x to upscale 16 images per round
-#define FRAMES_PER_UPSCALE_ROUND 1
+#define FRAMES_PER_UPSCALE_ROUND 128
 #define INITIAL_FRAME_BUFFER_SIZE 64
 
 typedef struct {
 	expandable_buffer buffer;
 	temp_file* file;
+	char* generic_output_filename; // The absolute path with the basename replaced with %s
+	char* output_filename;
 } temp_frame;
 temp_frame create_temp_frame(){
 	temp_frame frame;
 	frame.buffer = create_expandable_buffer(INITIAL_FRAME_BUFFER_SIZE);
 	frame.file = create_temp_file("wb+");
+
+	const char* new_basename = "/%s_output.png";
+
+	char* absolute_filename_dup = strdup(frame.file->absolute_filename);
+	const char* absolute_filename_dirname = dirname(absolute_filename_dup);
+	const size_t dirname_length = strlen(absolute_filename_dirname);
+	// TODO: Is it an issue if total_length > PATH_MAX?
+	const size_t total_length = dirname_length + strlen(new_basename) + 1;
+	frame.generic_output_filename = calloc(total_length, sizeof(char));
+	strcpy(frame.generic_output_filename, absolute_filename_dirname);
+	strcpy(frame.generic_output_filename + dirname_length, new_basename);
+	free(absolute_filename_dup);
+
+	absolute_filename_dup = strdup(frame.file->absolute_filename);
+	const char* absolute_filename_basename = basename(absolute_filename_dup);
+	frame.output_filename = calloc(PATH_MAX, sizeof(char));
+	snprintf(frame.output_filename, PATH_MAX, frame.generic_output_filename, absolute_filename_basename);
+	free(absolute_filename_dup);
+
+	// Open and close the file to make sure it exists
+	fclose(fopen(frame.output_filename, "wb"));
+	
+	fprintf(stdout, "temp file output name is: %s\n", frame.output_filename);
 	return frame;
 }
 void free_temp_frame(temp_frame* frame){
 	free_temp_file(&frame->file);
+	free(frame->generic_output_filename);
+	unlink(frame->output_filename);
+	free(frame->output_filename);
 }
 
 typedef struct {
@@ -208,11 +237,10 @@ int main(int argc, char* argv[]){
 	
     // waifu2x doesn't like using stdout
 	// TODO: Forcing cudnn makes it fail
-	//char* waifu2x_command[] = { "th", "./waifu2x.lua", "-m", "scale",  "-i", input_frame->absolute_filename, "-o", output_frame->absolute_filename, NULL };
 	char* waifu2x_command[] = { "th", "./waifu2x.lua",
 								"-m", "scale",
 								"-l", "/dev/stdin",
-								"-o", "%s.png", // Ideally this will output to the old input
+								"-o", temp_frames[0].generic_output_filename, // TODO: Only do one calculation for generic_output_filename
 								NULL };
 	const size_t waifu2x_command_output_file_index = 7; 
 	char* waifu2x_location = "./waifu2x/";
@@ -225,6 +253,7 @@ int main(int argc, char* argv[]){
 		for (frameInputIndex = 0; frameInputIndex < FRAMES_PER_UPSCALE_ROUND; frameInputIndex++){
 			temp_frame* frame = &temp_frames[frameInputIndex];
 			// Read the PNG from ffmpeg
+			// TODO: Suppress error when reading from an empty pipe
 			if (expandable_buffer_read_png_in(&frame->buffer, ffmpeg_source_output) != 0)
 				break;
 			// Write it out 
@@ -236,7 +265,6 @@ int main(int argc, char* argv[]){
 		int total_frames_this_round = frameInputIndex;
 
 		// Wait for waifu2x
-		//pipe_data waifu2x_output_pipe = create_pipe_data();
 		waifu2x_process.input_pipe = create_pipe_data();
 		FILE* waifu2x_input_file = fdopen(waifu2x_process.input_pipe.files.write_to, "wb");
 			
@@ -247,7 +275,6 @@ int main(int argc, char* argv[]){
 		for (frame_output_index = 0; frame_output_index < total_frames_this_round; frame_output_index++){
 			temp_frame* frame = &temp_frames[frame_output_index];
 			
-			//expandable_buffer_write_to_pipe(&frame->buffer, waifu2x_input_file);
 			char* str = frame->file->absolute_filename;
 			fwrite(str, sizeof(*str), strlen(str), waifu2x_input_file);
 			fputc('\n', waifu2x_input_file);	
@@ -255,35 +282,22 @@ int main(int argc, char* argv[]){
 		fflush(waifu2x_input_file);
 		fclose(waifu2x_input_file);	
 		
-//pipe_data_close_write_to(&waifu2x_output_pipe); // We shouldn't be able to write to the output
-		//dup2(dev_null_write, waifu2x_output_pipe.files.read_from); // Send the output to /dev/null because we don't care about it
-		//fprintf(stderr, "Waiting for waifu\n");
 		waitid(P_PID, waifu2x_process.pid, NULL, WSTOPPED|WEXITED);
-		//waitpid(waifu2x_process_pid, NULL, 0);	
-		//pipe_data_close(&waifu2x_output_pipe);
 		pipe_data_close(&waifu2x_process.input_pipe);
 		
-		//reopen_temp_file(output_frame, "rb");
 		for (frame_output_index = 0; frame_output_index < total_frames_this_round; frame_output_index++){
 			temp_frame* frame = &temp_frames[frame_output_index];
-			expandable_buffer_read_png_in(&frame->buffer, frame->file->file);
-			expandable_buffer_write_to_pipe(&frame->buffer, ffmpeg_result_input);
+			FILE* output_file = fopen(frame->output_filename, "rb");
+			if (expandable_buffer_read_png_in(&frame->buffer, output_file) == 0){
+				expandable_buffer_write_to_pipe(&frame->buffer, ffmpeg_result_input);
+			}else{
+				fprintf(stderr, "Error reading PNG from %s...\n", frame->output_filename);
+			}
+			fclose(output_file);
 		}
 
-		///raise(SIGINT);
-		
-		//if (buffer.pointer[buffer.size-1])fprintf(stderr, "End of output file: %d\n", buffer.pointer[buffer.size-1]);
-		//last_output_frame_size = buffer.size;
-		//fflush(stderr);
-		//break;
 		if (should_stop != 0) fprintf(stderr, "got sigint\n");
 	}
-	//expandable_buffer_clear(&buffer);
-	//expandable_buffer_push_file_end(&buffer);
-	//expandable_buffer_write_to_pipe(&buffer, ffmpeg_result_input);
-	/*fprintf(stderr, "\n");
-	fflush(stderr);*/
-
 
 	// Wait for the FFMpeg result process to finish
 	fflush(ffmpeg_result_input);
