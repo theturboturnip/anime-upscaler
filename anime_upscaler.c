@@ -11,6 +11,7 @@
 #include <sys/types.h>
 #include <libgen.h>
 #include <stdatomic.h>
+#include <poll.h>
 
 #include "expandable_buffer.h"
 
@@ -165,6 +166,7 @@ typedef struct {
 } waifu2x_process_data;
 
 static volatile sig_atomic_t stop_signalled = 0;
+static volatile sig_atomic_t ffmpeg_src_stopped = 0;
 
 static struct {
 	union {
@@ -182,7 +184,9 @@ void stop_program_from_signal(int sig){
 	if (sig == SIGCHLD){
 		int exit_status = 0;
 		pid_t exited_pid = wait(&exit_status);
-		// Ignore SIGCHLD if it's a clean exit 
+		if (atomic_load(&session_data.ffmpeg_src_process) == exited_pid)
+			ffmpeg_src_stopped = 1;
+		// Ignore SIGCHLD if it's a clean exit
 		if (WIFEXITED(exit_status)) return;
 	}
 	if (stop_signalled) return;
@@ -311,21 +315,23 @@ int main(int argc, char* argv[]){
 	int current_frame = 0;
 	size_t last_output_frame_size = 0;
 	while(stop_signalled == 0){
-		int frameInputIndex;
-		for (frameInputIndex = 0; frameInputIndex < session_data.temp_frame_count; frameInputIndex++){
+		int frameInputIndex = 0;
+		for (frameInputIndex = 0;
+			 frameInputIndex < session_data.temp_frame_count;
+			 frameInputIndex++){
 			temp_frame* frame = &session_data.temp_frames[frameInputIndex];
 			// Read the PNG from ffmpeg
-			// TODO: Suppress error when reading from an empty pipe
-			if (expandable_buffer_read_png_in(&frame->buffer, ffmpeg_source_output) != 0)
+			if (expandable_buffer_read_png_in(&frame->buffer, ffmpeg_source_output) != 0){
 				break;
+			}
 			// Write it out 
 			expandable_buffer_write_to_file(&frame->buffer, frame->file->file);
 			fflush(frame->file->file);
 		}
-		// TODO: This should only trigger if the ffmpeg source process has finished
+		// This will only trigger if the ffmpeg input connection has been closed and all files have been read
 		if (frameInputIndex == 0){
-			fprintf(stderr, "No pngs found\n");
-			break; // If no PNG files were read, then stop
+			fprintf(stderr, "No more data from ffmpeg, stopping...\n");
+			break;
 		}
 		
 		int total_frames_this_round = frameInputIndex;

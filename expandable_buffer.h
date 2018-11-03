@@ -71,7 +71,15 @@ int expandable_buffer_read_png_in(expandable_buffer* buffer, FILE* in){
 	expandable_buffer_clear(buffer);
 	
 	// Read header
-	if (expandable_buffer_read_data_in(buffer, in, HEADER_SIZE) != HEADER_SIZE){
+	switch(expandable_buffer_read_data_in(buffer, in, HEADER_SIZE)){
+	case 0:
+		// The file has no data
+		assert(feof(in));
+		return 1;
+	case HEADER_SIZE:
+		// No problem
+		break;
+	default:
 		fprintf(stderr, "Problem reading header\n");
 		return 1;
 	}
