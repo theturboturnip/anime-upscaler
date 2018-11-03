@@ -10,6 +10,7 @@
 #include <sys/wait.h>
 #include <sys/types.h>
 #include <libgen.h>
+#include <stdatomic.h>
 
 #include "expandable_buffer.h"
 
@@ -163,11 +164,46 @@ typedef struct {
 	pipe_data input_pipe;
 } waifu2x_process_data;
 
-static volatile sig_atomic_t should_stop = 0;
+static volatile sig_atomic_t stop_signalled = 0;
 
-void SIGINT_handler(int sig){
-	signal(sig, SIG_IGN);
-	should_stop = 1;
+static struct {
+	union {
+		volatile _Atomic pid_t processes[3];
+		struct {
+			volatile _Atomic pid_t ffmpeg_src_process;
+		   	volatile _Atomic pid_t ffmpeg_rst_process;
+			volatile _Atomic pid_t waifu2x_process;
+		};
+	};
+	temp_frame* temp_frames;
+	size_t temp_frame_count;
+} session_data = { .processes={0}, .temp_frames=NULL, .temp_frame_count=0};
+void stop_program_from_signal(int sig){
+	if (sig == SIGCHLD){
+		int exit_status = 0;
+		pid_t exited_pid = wait(&exit_status);
+		// Ignore SIGCHLD if it's a clean exit 
+		if (WIFEXITED(exit_status)) return;
+	}
+	if (stop_signalled) return;
+	
+	if (sig == SIGINT) signal(SIGINT, SIG_IGN);
+	
+	int i;
+	for (i = 0; i < 3; i++){
+		size_t process_to_kill = atomic_load(&session_data.processes[i]);
+		if (process_to_kill != 0)
+			kill(process_to_kill, SIGINT);
+	}
+	
+	stop_signalled = 1;
+}
+
+void cleanup(){
+	int i;
+	for (i = 0; i < session_data.temp_frame_count; i++)
+		free_temp_frame(&session_data.temp_frames[i]);
+	free(session_data.temp_frames);
 }
 
 int main(int argc, char* argv[]){
@@ -212,7 +248,8 @@ int main(int argc, char* argv[]){
 									  "-vcodec", "png", "-f", "image2pipe", "-",
 									  NULL };
 	pid_t ffmpeg_source_pid = run_command(ffmpeg_source_command, NULL, &ffmpeg_source_input_pipe, &ffmpeg_source_output_pipe, 1);
-
+	atomic_store(&session_data.ffmpeg_src_process, ffmpeg_source_pid);
+	
 	dup2(dev_null_read, ffmpeg_source_input_pipe.files.write_to); // Send /dev/null to the input so that it doesn't use the terminal
 	pipe_data_close_read_from(&ffmpeg_source_input_pipe); // We shouldn't be able to read from the input
 	pipe_data_close_write_to(&ffmpeg_source_output_pipe); // We shouldn't be able to write to the output
@@ -233,34 +270,39 @@ int main(int argc, char* argv[]){
 									  NULL };
 	char* echo_stdin_command[] = { "cat" };
 	pid_t ffmpeg_result_pid = run_command(ffmpeg_result_command, NULL, &ffmpeg_result_input_pipe, NULL, 1);//&ffmpeg_result_output_pipe);
-
+	atomic_store(&session_data.ffmpeg_rst_process, ffmpeg_result_pid);
+	
 	FILE *ffmpeg_result_input = fdopen(ffmpeg_result_input_pipe.files.write_to, "w"); // Open the input as a pipe so we can put images in it
 	pipe_data_close_read_from(&ffmpeg_result_input_pipe); // We shouldn't be able to read from the input
 	//pipe_data_close_write_to(&ffmpeg_result_output_pipe); // We shouldn't be able to write to the output
 	//dup2(dev_null_write, ffmpeg_result_output_pipe.files.read_from); // Send the output to /dev/null because we don't care about it
 
 	// Set upu the interrupt handles
+	
 	struct sigaction sigint_action;
-	sigint_action.sa_handler = SIGINT_handler;
+	sigint_action.sa_handler = stop_program_from_signal;
 	sigaction(SIGINT, &sigint_action, NULL);
-	sigaction(SIGQUIT, &sigint_action, NULL);
+	sigaction(SIGPIPE, &sigint_action, NULL);
+	sigaction(SIGCHLD, &sigint_action, NULL);
+	//sigaction(SIGQUIT, &sigint_action, NULL);
 	
 	// Set up the temp files AFTER the interrupt handler is set
 	// If someone Ctrl-C's before this, we'll die right away
 	// If someone Ctrl-C's after this, we'll get rid of the tempfiles properly
-	temp_frame temp_frames[FRAMES_PER_UPSCALE_ROUND];
+	session_data.temp_frame_count = FRAMES_PER_UPSCALE_ROUND;
+	session_data.temp_frames = calloc(session_data.temp_frame_count, sizeof(temp_frame));
 	{
 		int i;
-		for (i = 0; i < FRAMES_PER_UPSCALE_ROUND; i++) temp_frames[i] = create_temp_frame();
+		for (i = 0; i < session_data.temp_frame_count; i++) session_data.temp_frames[i] = create_temp_frame();
 	}
+	atexit(cleanup);
 	
     // waifu2x doesn't like using stdout
-	// TODO: Forcing cudnn makes it fail
 	char* waifu2x_command[] = { "th", "./waifu2x.lua",
 								"-force_cudnn", "1",
 								"-m", "noise_scale", "-noise_level", "1",
 								"-l", "/dev/stdin",
-								"-o", temp_frames[0].generic_output_filename, // TODO: Only do one calculation for generic_output_filename
+								"-o", session_data.temp_frames[0].generic_output_filename, // TODO: Only do one calculation for generic_output_filename
 								NULL };
 	const size_t waifu2x_command_output_file_index = 7; 
 	char* waifu2x_location = "./waifu2x/";
@@ -268,10 +310,10 @@ int main(int argc, char* argv[]){
 	
 	int current_frame = 0;
 	size_t last_output_frame_size = 0;
-	while(should_stop == 0){
+	while(stop_signalled == 0){
 		int frameInputIndex;
-		for (frameInputIndex = 0; frameInputIndex < FRAMES_PER_UPSCALE_ROUND; frameInputIndex++){
-			temp_frame* frame = &temp_frames[frameInputIndex];
+		for (frameInputIndex = 0; frameInputIndex < session_data.temp_frame_count; frameInputIndex++){
+			temp_frame* frame = &session_data.temp_frames[frameInputIndex];
 			// Read the PNG from ffmpeg
 			// TODO: Suppress error when reading from an empty pipe
 			if (expandable_buffer_read_png_in(&frame->buffer, ffmpeg_source_output) != 0)
@@ -280,6 +322,7 @@ int main(int argc, char* argv[]){
 			expandable_buffer_write_to_file(&frame->buffer, frame->file->file);
 			fflush(frame->file->file);
 		}
+		// TODO: This should only trigger if the ffmpeg source process has finished
 		if (frameInputIndex == 0){
 			fprintf(stderr, "No pngs found\n");
 			break; // If no PNG files were read, then stop
@@ -290,13 +333,14 @@ int main(int argc, char* argv[]){
 		// Wait for waifu2x
 		waifu2x_process.input_pipe = create_pipe_data();
 		FILE* waifu2x_input_file = fdopen(waifu2x_process.input_pipe.files.write_to, "wb");
-			
+		
 		waifu2x_process.pid = run_command(waifu2x_command, waifu2x_location, &waifu2x_process.input_pipe, NULL, 0);
+		atomic_store(&session_data.waifu2x_process, waifu2x_process.pid);
 		pipe_data_close_read_from(&waifu2x_process.input_pipe);
 		
 		int frame_output_index;
 		for (frame_output_index = 0; frame_output_index < total_frames_this_round; frame_output_index++){
-			temp_frame* frame = &temp_frames[frame_output_index];
+			temp_frame* frame = &session_data.temp_frames[frame_output_index];
 			
 			char* str = frame->file->absolute_filename;
 			fwrite(str, sizeof(*str), strlen(str), waifu2x_input_file);
@@ -304,13 +348,17 @@ int main(int argc, char* argv[]){
 		}
 		fflush(waifu2x_input_file);
 		fclose(waifu2x_input_file);	
-		
+
+		// If this is Ctrl-C'd, this program closes because of a bad pipe
+		// Soln. handle SIGPIPE like SIGINT etc.
 		waitid(P_PID, waifu2x_process.pid, NULL, WSTOPPED|WEXITED);
 		pipe_data_close(&waifu2x_process.input_pipe);
-		fprintf(stderr, "Done waiting\n");
+		//fprintf(stderr, "Done waiting\n");
 		
 		for (frame_output_index = 0; frame_output_index < total_frames_this_round; frame_output_index++){
-			temp_frame* frame = &temp_frames[frame_output_index];
+			if (stop_signalled != 0) break;
+			
+			temp_frame* frame = &session_data.temp_frames[frame_output_index];
 			FILE* output_file = fopen(frame->output_filename, "rb");
 			if (expandable_buffer_read_png_in(&frame->buffer, output_file) == 0){
 				expandable_buffer_write_to_pipe(&frame->buffer, ffmpeg_result_input);
@@ -319,11 +367,13 @@ int main(int argc, char* argv[]){
 			}
 			fclose(output_file);
 		}
-		fprintf(stderr, "looping bvack\n");
+		//fprintf(stderr, "looping bvack\n");
 
-		if (should_stop != 0) fprintf(stderr, "got sigint\n");
+		if (stop_signalled != 0) fprintf(stderr, "got sigint\n");
 	}
 
+	if (stop_signalled) exit(0);
+	
 	// Wait for the FFMpeg result process to finish
 	fflush(ffmpeg_result_input);
     fclose(ffmpeg_result_input);
@@ -344,9 +394,4 @@ int main(int argc, char* argv[]){
 	waitpid(ffmpeg_source_pid, NULL, 0);
 	pipe_data_close(&ffmpeg_source_input_pipe);
 	pipe_data_close(&ffmpeg_source_output_pipe);
-
-	{
-		int i;
-		for (i = 0; i < FRAMES_PER_UPSCALE_ROUND; i++) free_temp_frame(&temp_frames[i]);
-	}
 }
