@@ -3,5 +3,7 @@
 !anime_upscaler.c
 !Makefile
 !expandable_buffer.h
+!process_utils.h
+!temp_files.h
 !.gitignore
 !.gitmodules

@@ -14,151 +14,8 @@
 #include <poll.h>
 
 #include "expandable_buffer.h"
-
-typedef union {
-	int array[2];
-	struct {
-		int read_from; // read from
-		int write_to; // write to
-	} files;
-} pipe_data;
-
-pipe_data create_pipe_data(){
-	pipe_data data;
-	pipe(data.array);
-	return data;
-}
-void pipe_data_close(pipe_data* pipe){
-	if (pipe->array[0] != -1) close(pipe->array[0]);
-	if (pipe->array[1] != -1) close(pipe->array[1]);
-
-	pipe->array[0] = -1;
-	pipe->array[1] = -1;
-}
-void pipe_data_close_read_from(pipe_data* pipe){
-	close(pipe->files.read_from);
-	pipe->files.read_from = -1;
-}
-void pipe_data_close_write_to(pipe_data* pipe){
-	close(pipe->files.write_to);
-	pipe->files.write_to = -1;
-}
-
-int run_command(char* const command[], char* working_directory, pipe_data* input_pipe, pipe_data* output_pipe, int mute_stderr){
-	pid_t process_id = fork();
-	switch(process_id){
-	case -1:
-		fprintf(stderr, "fork() failed\n");
-		exit(1);
-	case 0:
-		// We are the new process, start the command
-		if (input_pipe != NULL){
-			// Redirect stdin
-			if (dup2(input_pipe->files.read_from, 0) < 0){
-				pipe_data_close_read_from(input_pipe);
-				fprintf(stderr, "Failed to redirect input for command %s\n", command[0]);
-				exit(1);
-			}
-			pipe_data_close_write_to(input_pipe); // We don't need this anymore
-		}
-		if (output_pipe != NULL){
-			// Redirect stdout
-			if (dup2(output_pipe->files.write_to, 1) < 0){
-				pipe_data_close_write_to(output_pipe);
-				fprintf(stderr, "Failed to redirect output for command %s\n", command[0]);
-				exit(1);
-			}
-			pipe_data_close_read_from(output_pipe); // We don't need this anymore
-		}
-		// Redirect stderr to /dev/null
-		if (mute_stderr != 0) freopen("/dev/null", "w", stderr);
-		if (working_directory != NULL){
-			chdir(working_directory);
-		}
-		// Run ffmpeg
-		execvp(command[0], command);
-		// Handle ffmpeg failing
-		// TODO: This won't display (i think)
-		fprintf(stderr, "Failed to exec() command %s with err %s\n", command[0], strerror(errno));
-		exit(1);
-	}
-	return process_id;
-}
-
-typedef struct {
-	char absolute_filename[PATH_MAX];
-	FILE* file;
-} temp_file;
-temp_file* create_temp_file(char* access_type){
-	char filename[] = "/tmp/anime-upscaler-tempfile-XXXXXX";
-	int file_descriptor = mkstemp(filename);
-	if (file_descriptor == -1){
-		fprintf(stderr, "Failed to create temp file\n");
-		exit(1);
-	}
-
-	temp_file* tfile = malloc(sizeof(temp_file));
-	
-	realpath(filename, tfile->absolute_filename);
-	tfile->file = fdopen(file_descriptor, access_type);
-	return tfile;
-}
-void free_temp_file(temp_file** tfile_pointer){
-	// The temp file will automatically be destroyed once unlinked
-	unlink((*tfile_pointer)->absolute_filename);
-	fclose((*tfile_pointer)->file);
-	free(*tfile_pointer);
-	*tfile_pointer = NULL;
-}
-void reopen_temp_file(temp_file* tfile, char* access_type){
-	tfile->file = freopen(tfile->absolute_filename, access_type, tfile->file);
-}
-
-// Use waifu2x to upscale 16 images per round
-#define FRAMES_PER_UPSCALE_ROUND 256
-#define INITIAL_FRAME_BUFFER_SIZE 64
-
-typedef struct {
-	expandable_buffer buffer;
-	temp_file* file;
-	char* generic_output_filename; // The absolute path with the basename replaced with %s
-	char* output_filename;
-} temp_frame;
-temp_frame create_temp_frame(){
-	temp_frame frame;
-	frame.buffer = create_expandable_buffer(INITIAL_FRAME_BUFFER_SIZE);
-	frame.file = create_temp_file("wb+");
-
-	const char* new_basename = "/%s_output.png";
-
-	char* absolute_filename_dup = strdup(frame.file->absolute_filename);
-	const char* absolute_filename_dirname = dirname(absolute_filename_dup);
-	const size_t dirname_length = strlen(absolute_filename_dirname);
-	// TODO: Is it an issue if total_length > PATH_MAX?
-	const size_t total_length = dirname_length + strlen(new_basename) + 1;
-	frame.generic_output_filename = calloc(total_length, sizeof(char));
-	strcpy(frame.generic_output_filename, absolute_filename_dirname);
-	strcpy(frame.generic_output_filename + dirname_length, new_basename);
-	free(absolute_filename_dup);
-
-	absolute_filename_dup = strdup(frame.file->absolute_filename);
-	const char* absolute_filename_basename = basename(absolute_filename_dup);
-	frame.output_filename = calloc(PATH_MAX, sizeof(char));
-	snprintf(frame.output_filename, PATH_MAX, frame.generic_output_filename, absolute_filename_basename);
-	free(absolute_filename_dup);
-
-	// Open and close the file to make sure it exists
-	fclose(fopen(frame.output_filename, "wb"));
-	
-	//fprintf(stdout, "temp file output name is: %s\n", frame.output_filename);
-	return frame;
-}
-void free_temp_frame(temp_frame* frame){
-	free_temp_file(&frame->file);
-	free(frame->generic_output_filename);
-	unlink(frame->output_filename);
-	free(frame->output_filename);
-}
+#include "process_utils.h"
+#include "temp_files.h"
 
 typedef struct {
 	int pid;
@@ -204,10 +61,33 @@ void stop_program_from_signal(int sig){
 }
 
 void cleanup(){
+	if (session_data.temp_frames == NULL) return;
 	int i;
 	for (i = 0; i < session_data.temp_frame_count; i++)
 		free_temp_frame(&session_data.temp_frames[i]);
 	free(session_data.temp_frames);
+	session_data.temp_frames = NULL;
+}
+
+// Use waifu2x to upscale 16 images per round
+#define FRAMES_PER_UPSCALE_ROUND 256
+
+void get_framerate(char* filepath, char* output, size_t output_length){
+	pipe_data ffmpeg_framerate_output_pipe = create_pipe_data();
+	const char* ffmpeg_framerate_command_format = "ffmpeg -i %s 2>&1 | sed -n \"s/.*, \\(.*\\) fps.*/\\1/p\"";
+	const size_t ffmpeg_framerate_command_length = strlen(ffmpeg_framerate_command_format) + strlen(filepath) + 1;
+	char* ffmpeg_framerate_command = calloc(ffmpeg_framerate_command_length, sizeof(char));
+	snprintf(ffmpeg_framerate_command, ffmpeg_framerate_command_length, ffmpeg_framerate_command_format, filepath);
+	char* ffmpeg_framerate_invocation_command[] = { "bash", "-c", ffmpeg_framerate_command, NULL };
+	pid_t ffmpeg_framerate_pid = run_command(ffmpeg_framerate_invocation_command, NULL, NULL, &ffmpeg_framerate_output_pipe, 0);
+	pipe_data_close_write_to(&ffmpeg_framerate_output_pipe);
+	FILE* ffmpeg_framerate_output = fdopen(ffmpeg_framerate_output_pipe.files.read_from, "r");
+
+	fread(output, sizeof(char), output_length, ffmpeg_framerate_output);
+	
+	fclose(ffmpeg_framerate_output);
+	pipe_data_close(&ffmpeg_framerate_output_pipe);
+	free(ffmpeg_framerate_command);
 }
 
 int main(int argc, char* argv[]){
@@ -222,19 +102,8 @@ int main(int argc, char* argv[]){
 	/* 
 	   Get the framerate of the video
 	*/
-	pipe_data ffmpeg_framerate_output_pipe = create_pipe_data();
-	const char* ffmpeg_framerate_command_format = "ffmpeg -i %s 2>&1 | sed -n \"s/.*, \\(.*\\) fps.*/\\1/p\"";
-	const size_t ffmpeg_framerate_command_length = strlen(ffmpeg_framerate_command_format) + strlen(input_filepath) + 1;
-	char* ffmpeg_framerate_command = calloc(ffmpeg_framerate_command_length, sizeof(char));
-	snprintf(ffmpeg_framerate_command, ffmpeg_framerate_command_length, ffmpeg_framerate_command_format, input_filepath);
-	char* ffmpeg_framerate_invocation_command[] = { "bash", "-c", ffmpeg_framerate_command, NULL };
-	pid_t ffmpeg_framerate_pid = run_command(ffmpeg_framerate_invocation_command, NULL, NULL, &ffmpeg_framerate_output_pipe, 0);
-	pipe_data_close_write_to(&ffmpeg_framerate_output_pipe);
-	FILE* ffmpeg_framerate_output = fdopen(ffmpeg_framerate_output_pipe.files.read_from, "r");
-	char framerate_str[5] = { '\0' };
-	fread(framerate_str, sizeof(char), 4, ffmpeg_framerate_output);
-	fclose(ffmpeg_framerate_output);
-	pipe_data_close(&ffmpeg_framerate_output_pipe);
+	char framerate_str[10] = { '\0' };
+	get_framerate(input_filepath, framerate_str, 10);
 	fprintf(stdout, "Framerate: %s\n", framerate_str);
 	if (strlen(framerate_str) == 0) exit(1);
 
@@ -248,10 +117,11 @@ int main(int argc, char* argv[]){
 	pipe_data ffmpeg_source_output_pipe = create_pipe_data();
 	char* ffmpeg_source_command[] = { "ffmpeg", "-y",
 									  "-i", input_filepath,
+									  "-vf", "fps=30",
 									  //"-ss", "00:00:01",
 									  "-vcodec", "png", "-f", "image2pipe", "-",
 									  NULL };
-	pid_t ffmpeg_source_pid = run_command(ffmpeg_source_command, NULL, &ffmpeg_source_input_pipe, &ffmpeg_source_output_pipe, 1);
+	pid_t ffmpeg_source_pid = run_command(ffmpeg_source_command, NULL, &ffmpeg_source_input_pipe, &ffmpeg_source_output_pipe, 0);
 	atomic_store(&session_data.ffmpeg_src_process, ffmpeg_source_pid);
 	
 	dup2(dev_null_read, ffmpeg_source_input_pipe.files.write_to); // Send /dev/null to the input so that it doesn't use the terminal
@@ -266,13 +136,13 @@ int main(int argc, char* argv[]){
 	//pipe_data ffmpeg_result_output_pipe = create_pipe_data();
 	char* ffmpeg_result_command[] = { "ffmpeg", "-y",
 									  "-i", input_filepath,
+									  //"-vcodec", "copy",
 									  //"-vsync", "drop",
-									  "-r", framerate_str,
+									  "-r", "30",
 									  "-vcodec", "png", "-f", "image2pipe", "-i", "-",
 									  /*"-c:a", "copy",*/ "-map", "1:v:0", "-map", "0:a:0", 
 									  output_filepath,
 									  NULL };
-	char* echo_stdin_command[] = { "cat" };
 	pid_t ffmpeg_result_pid = run_command(ffmpeg_result_command, NULL, &ffmpeg_result_input_pipe, NULL, 1);//&ffmpeg_result_output_pipe);
 	atomic_store(&session_data.ffmpeg_rst_process, ffmpeg_result_pid);
 	
@@ -315,11 +185,11 @@ int main(int argc, char* argv[]){
 	int current_frame = 0;
 	size_t last_output_frame_size = 0;
 	while(stop_signalled == 0){
-		int frameInputIndex = 0;
-		for (frameInputIndex = 0;
-			 frameInputIndex < session_data.temp_frame_count;
-			 frameInputIndex++){
-			temp_frame* frame = &session_data.temp_frames[frameInputIndex];
+		int frame_input_index = 0;
+		for (frame_input_index = 0;
+			 frame_input_index < session_data.temp_frame_count;
+			 frame_input_index++){
+			temp_frame* frame = &session_data.temp_frames[frame_input_index];
 			// Read the PNG from ffmpeg
 			if (expandable_buffer_read_png_in(&frame->buffer, ffmpeg_source_output) != 0){
 				break;
@@ -329,12 +199,12 @@ int main(int argc, char* argv[]){
 			fflush(frame->file->file);
 		}
 		// This will only trigger if the ffmpeg input connection has been closed and all files have been read
-		if (frameInputIndex == 0){
+		if (frame_input_index == 0){
 			fprintf(stderr, "No more data from ffmpeg, stopping...\n");
 			break;
 		}
 		
-		int total_frames_this_round = frameInputIndex;
+		int total_frames_this_round = frame_input_index;
 
 		// Wait for waifu2x
 		waifu2x_process.input_pipe = create_pipe_data();
@@ -400,4 +270,6 @@ int main(int argc, char* argv[]){
 	waitpid(ffmpeg_source_pid, NULL, 0);
 	pipe_data_close(&ffmpeg_source_input_pipe);
 	pipe_data_close(&ffmpeg_source_output_pipe);
+
+	cleanup();
 }
