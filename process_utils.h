@@ -8,21 +8,31 @@ typedef union {
 
 pipe_data create_pipe_data(){
 	pipe_data data;
-	pipe(data.array);
+	if (pipe(data.array)){
+		fprintf(stderr, "Failed to create pipe\n");
+	}else{
+		fprintf(stderr, "Created pipe %d %d\n", data.array[0], data.array[1]);
+	}
 	return data;
 }
 void pipe_data_close(pipe_data* pipe){
-	if (pipe->array[0] != -1) close(pipe->array[0]);
+	if (pipe->array[0] != -1){
+		fprintf(stderr, "closing %d from %d\n", pipe->array[0], getpid());
+		close(pipe->array[0]);
+	}
 	if (pipe->array[1] != -1) close(pipe->array[1]);
 
 	pipe->array[0] = -1;
 	pipe->array[1] = -1;
 }
 void pipe_data_close_read_from(pipe_data* pipe){
+	assert(pipe->files.read_from != -1);
 	close(pipe->files.read_from);
+	fprintf(stderr, "closed %d from %d\n", pipe->files.read_from, getpid());
 	pipe->files.read_from = -1;
 }
 void pipe_data_close_write_to(pipe_data* pipe){
+	assert(pipe->files.write_to != -1);
 	close(pipe->files.write_to);
 	pipe->files.write_to = -1;
 }

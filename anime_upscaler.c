@@ -74,23 +74,25 @@ void cleanup(){
 //#define FRAMES_PER_UPSCALE_ROUND 256
 
 void get_framerate(char* filepath, char* output, size_t output_length){
-	pipe_data ffmpeg_framerate_output_pipe = create_pipe_data();
 	const char* ffmpeg_framerate_command_format = "ffmpeg -i %s 2>&1 | sed -n \"s/.*, \\(.*\\) fps.*/\\1/p\"";
 	const size_t ffmpeg_framerate_command_length = strlen(ffmpeg_framerate_command_format) + strlen(filepath) + 1;
 	char* ffmpeg_framerate_command = calloc(ffmpeg_framerate_command_length, sizeof(char));
 	snprintf(ffmpeg_framerate_command, ffmpeg_framerate_command_length, ffmpeg_framerate_command_format, filepath);
+
+	pipe_data ffmpeg_framerate_output_pipe = create_pipe_data();
 	char* ffmpeg_framerate_invocation_command[] = { "bash", "-c", ffmpeg_framerate_command, NULL };
 	pid_t ffmpeg_framerate_pid = run_command(ffmpeg_framerate_invocation_command, NULL, NULL, &ffmpeg_framerate_output_pipe, 0);
 	pipe_data_close_write_to(&ffmpeg_framerate_output_pipe);
-	FILE* ffmpeg_framerate_output = fdopen(ffmpeg_framerate_output_pipe.files.read_from, "r");
 
+	FILE* ffmpeg_framerate_output = fdopen(ffmpeg_framerate_output_pipe.files.read_from, "r");
 	fread(output, sizeof(char), output_length, ffmpeg_framerate_output);
 	// Remove trailing newline
 	output[strcspn(output, "\n")] = 0;
 	
 	fclose(ffmpeg_framerate_output);
-	pipe_data_close(&ffmpeg_framerate_output_pipe);
+	// This ends up closing the pipe?
 	free(ffmpeg_framerate_command);
+	
 }
 
 #define DEFAULT_FRAMES_PER_UPSCALE_ROUND 256
@@ -211,13 +213,27 @@ Waifu2x model: %s\n",
 	/* 
 	   Get the framerate of the video
 	*/
+	if (errno){
+		fprintf(stderr, "preframerate err: %s\n", strerror(errno));
+		errno = 0;
+	}
 	char framerate_str[10] = { '\0' };
 	get_framerate(options.input_filepath, framerate_str, 10);
 	fprintf(stdout, "Framerate: %s\n", framerate_str);
 	if (strlen(framerate_str) == 0) exit(1);
+	if (errno){
+		fprintf(stderr, "predevnull err: %s\n", strerror(errno));
+		errno = 0;
+		exit(errno);
+	}
 
 	int dev_null_read = open("/dev/null", O_RDONLY);
 	int dev_null_write = open("/dev/null", O_WRONLY);
+	if (errno){
+		fprintf(stderr, "presetuperr: %s\n", strerror(errno));
+		errno = 0;
+		exit(errno);
+	}
 
 	/*
 	  Set up the ffmpeg source daemon
@@ -231,7 +247,7 @@ Waifu2x model: %s\n",
 	const size_t ffmpeg_filter_command_length = strlen(ffmpeg_filter_command_format) + strlen(framerate_str) + 1;
 	char* ffmpeg_filter_command = calloc(ffmpeg_filter_command_length, sizeof(char));
 	snprintf(ffmpeg_filter_command, ffmpeg_filter_command_length, ffmpeg_filter_command_format, framerate_str);
-	char* ffmpeg_source_command[] = { "ffmpeg", "-y",
+	char* ffmpeg_source_command[] = { "ffmpeg", "-y", "-hide_banner",
 									  "-i", options.input_filepath,
 									  "-vf", ffmpeg_filter_command,
 									  "-vcodec", "png", "-f", "image2pipe", "-",
@@ -245,20 +261,26 @@ Waifu2x model: %s\n",
 	pipe_data_close_write_to(&ffmpeg_source_output_pipe); // We shouldn't be able to write to the output
     FILE *ffmpeg_source_output = fdopen(ffmpeg_source_output_pipe.files.read_from, "r"); // Open the output as a pipe so we can read it
 
+	if (errno){
+		fprintf(stderr, "post ffmpeg src err: %s\n", strerror(errno));
+		errno = 0;
+	}
+	
 	/*
 	  Set up the ffmpeg result daemon
 	*/
 	pipe_data ffmpeg_result_input_pipe = create_pipe_data();
 	//pipe_data ffmpeg_result_output_pipe = create_pipe_data();
 
-	char* ffmpeg_result_command[] = { "ffmpeg", "-y",
+	char* ffmpeg_result_command[] = { "ffmpeg", "-y", "-hide_banner",
 									  "-i", options.input_filepath,
 									  "-r", framerate_str,
 									  "-vcodec", "png", "-f", "image2pipe", "-i", "-",
+									  "-max_muxing_queue_size", "9999", // Fixes a bug with ffmpeg
 									  "-map", "1:v:0", "-map", "0:a:0", 
 									  options.output_filepath,
 									  NULL };
-	pid_t ffmpeg_result_pid = run_command(ffmpeg_result_command, NULL, &ffmpeg_result_input_pipe, NULL, 1);//&ffmpeg_result_output_pipe);
+	pid_t ffmpeg_result_pid = run_command(ffmpeg_result_command, NULL, &ffmpeg_result_input_pipe, NULL, 0);//&ffmpeg_result_output_pipe);
 	atomic_store(&session_data.ffmpeg_rst_process, ffmpeg_result_pid);
 	
 	FILE *ffmpeg_result_input = fdopen(ffmpeg_result_input_pipe.files.write_to, "w"); // Open the input as a pipe so we can put images in it
@@ -266,6 +288,11 @@ Waifu2x model: %s\n",
 	//pipe_data_close_write_to(&ffmpeg_result_output_pipe); // We shouldn't be able to write to the output
 	//dup2(dev_null_write, ffmpeg_result_output_pipe.files.read_from); // Send the output to /dev/null because we don't care about it
 
+	if (errno){
+		fprintf(stderr, "post ffmpeg res err: %s\n", strerror(errno));
+		errno = 0;
+	}
+	
 	// Set upu the interrupt handles
 	
 	struct sigaction sigint_action;
@@ -289,14 +316,17 @@ Waifu2x model: %s\n",
     // waifu2x doesn't like using stdout
 	char* waifu2x_command[] = { "th", options.waifu2x_file,
 								"-force_cudnn", "1",
-								"-model_dir", options.waifu2x_model,
+								//"-model_dir", options.waifu2x_model,
 								"-m", "noise_scale", "-noise_level", "1",
 								"-l", "/dev/stdin",
 								"-o", session_data.temp_frames[0].generic_output_filename, // TODO: Only do one calculation for generic_output_filename
 								NULL };
 	//const size_t waifu2x_command_output_file_index = 7; 
 	waifu2x_process_data waifu2x_process;
-	
+	if (errno){
+		fprintf(stderr, "prelooperr: %s\n", strerror(errno));
+		errno = 0;
+	}
 	int current_frame = 0;
 	size_t last_output_frame_size = 0;
 	while(stop_signalled == 0){
@@ -318,7 +348,10 @@ Waifu2x model: %s\n",
 			fprintf(stderr, "No more data from ffmpeg, stopping...\n");
 			break;
 		}
-		
+		if (errno){
+			fprintf(stderr, "err: %s\n", strerror(errno));
+			errno = 0;
+		}
 		int total_frames_this_round = frame_input_index;
 
 		// Wait for waifu2x
@@ -339,12 +372,21 @@ Waifu2x model: %s\n",
 		}
 		fflush(waifu2x_input_file);
 		fclose(waifu2x_input_file);	
-
+		if (errno){
+			fprintf(stderr, "prewaif err: %s\n", strerror(errno));
+			exit(errno);
+			errno = 0;
+		}
 		// If this is Ctrl-C'd, this program closes because of a bad pipe
 		// Soln. handle SIGPIPE like SIGINT etc.
 		waitid(P_PID, waifu2x_process.pid, NULL, WSTOPPED|WEXITED);
-		pipe_data_close(&waifu2x_process.input_pipe);
+		//pipe_data_close(&waifu2x_process.input_pipe);
 		//fprintf(stderr, "Done waiting\n");
+		if (errno){
+			fprintf(stderr, "postwaif err: %s\n", strerror(errno));
+			exit(errno);
+			errno = 0;
+		}
 		
 		for (frame_output_index = 0; frame_output_index < total_frames_this_round; frame_output_index++){
 			if (stop_signalled != 0) break;
@@ -358,7 +400,10 @@ Waifu2x model: %s\n",
 			}
 			fclose(output_file);
 		}
-		//fprintf(stderr, "looping bvack\n");
+if (errno){
+			fprintf(stderr, "postout err: %s\n", strerror(errno));
+			errno = 0;
+		}		//fprintf(stderr, "looping bvack\n");
 
 		if (stop_signalled != 0) fprintf(stderr, "got sigint\n");
 	}

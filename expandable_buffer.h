@@ -155,6 +155,19 @@ void expandable_buffer_write_to_pipe(expandable_buffer* buffer, FILE* out){
 		size_t total_written = fwrite(pointer, sizeof(pointer[0]), size_left, out);
 		pointer += total_written;
 		size_left -= total_written;
+
+		assert(size_left == 0);
+		if (ferror(out)){
+			clearerr(out);
+
+			fd_set set;
+			FD_ZERO(&set);
+			FD_SET(fileno(out), &set);
+			if (select(FD_SETSIZE, NULL, &set, NULL, NULL) == -1){
+				fprintf(stderr, "Error writing to pipe\n");
+				fprintf(stderr, "%s", strerror(errno));
+			} 
+		}
 	}
 }
 
