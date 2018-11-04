@@ -45,6 +45,7 @@ void stop_program_from_signal(int sig){
 		if (atomic_load(&session_data.ffmpeg_src_process) == exited_pid)
 			ffmpeg_src_stopped = 1;
 		// Ignore SIGCHLD if it's a clean exit
+		// TODO: Unclean exits should be captured also
 		if (WIFEXITED(exit_status)) return;
 	}
 	if (stop_signalled) return;
@@ -252,7 +253,7 @@ Waifu2x model: %s\n",
 									  "-vf", ffmpeg_filter_command,
 									  "-vcodec", "png", "-f", "image2pipe", "-",
 									  NULL };
-	pid_t ffmpeg_source_pid = run_command(ffmpeg_source_command, NULL, &ffmpeg_source_input_pipe, &ffmpeg_source_output_pipe, 1);
+	pid_t ffmpeg_source_pid = run_command(ffmpeg_source_command, NULL, &ffmpeg_source_input_pipe, &ffmpeg_source_output_pipe, 0);
 	atomic_store(&session_data.ffmpeg_src_process, ffmpeg_source_pid);
 	free(ffmpeg_filter_command);
 	
@@ -299,7 +300,7 @@ Waifu2x model: %s\n",
 	sigint_action.sa_handler = stop_program_from_signal;
 	sigaction(SIGINT, &sigint_action, NULL);
 	sigaction(SIGPIPE, &sigint_action, NULL);
-	sigaction(SIGCHLD, &sigint_action, NULL);
+	//sigaction(SIGCHLD, &sigint_action, NULL);
 	//sigaction(SIGQUIT, &sigint_action, NULL);
 	
 	// Set up the temp files AFTER the interrupt handler is set
