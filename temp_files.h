@@ -1,9 +1,21 @@
+#include <sys/stat.h>
+#include <sys/types.h>
+
+#define TEMP_DIR "/dev/shm/anime-upscaler/"
+#define TEMP_FILE_PATTERN "anime-upscaler-tempfile-XXXXXX"
+#define TEMP_FILE_PATH_PATTERN TEMP_DIR TEMP_FILE_PATTERN
+
 typedef struct {
 	char absolute_filename[PATH_MAX];
 	FILE* file;
 } temp_file;
 temp_file* create_temp_file(char* access_type){
-	char filename[] = "/tmp/anime-upscaler-tempfile-XXXXXX";
+	struct stat st = {0};
+	if (stat(TEMP_DIR, &st) == -1){
+		mkdir(TEMP_DIR, 0700);
+	}
+	
+	char filename[] = TEMP_FILE_PATH_PATTERN;
 	int file_descriptor = mkstemp(filename);
 	if (file_descriptor == -1){
 		fprintf(stderr, "Failed to create temp file\n");
