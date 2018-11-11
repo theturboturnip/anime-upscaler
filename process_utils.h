@@ -10,34 +10,29 @@ pipe_data create_pipe_data(){
 	pipe_data data;
 	if (pipe(data.array)){
 		fprintf(stderr, "Failed to create pipe\n");
-	}else{
-		fprintf(stderr, "Created pipe %d %d\n", data.array[0], data.array[1]);
+		exit(1);
 	}
 	return data;
 }
 void pipe_data_close(pipe_data* pipe){
-	if (pipe->array[0] != -1){
-		fprintf(stderr, "closing %d from %d\n", pipe->array[0], getpid());
-		close(pipe->array[0]);
-	}
+	if (pipe->array[0] != -1) close(pipe->array[0]);
 	if (pipe->array[1] != -1) close(pipe->array[1]);
 
 	pipe->array[0] = -1;
 	pipe->array[1] = -1;
 }
 void pipe_data_close_read_from(pipe_data* pipe){
-	assert(pipe->files.read_from != -1);
+	if(pipe->files.read_from == -1) return;
 	close(pipe->files.read_from);
-	fprintf(stderr, "closed %d from %d\n", pipe->files.read_from, getpid());
 	pipe->files.read_from = -1;
 }
 void pipe_data_close_write_to(pipe_data* pipe){
-	assert(pipe->files.write_to != -1);
+	if(pipe->files.write_to == -1) return;
 	close(pipe->files.write_to);
 	pipe->files.write_to = -1;
 }
 
-int run_command(char* const command[], char* working_directory, pipe_data* input_pipe, pipe_data* output_pipe, int mute_stderr){
+pid_t fork_to_function(int (*func)(void*), void* data, char* working_directory, pipe_data* input_pipe, pipe_data* output_pipe, pipe_data* err_pipe){
 	pid_t process_id = fork();
 	switch(process_id){
 	case -1:
@@ -49,7 +44,7 @@ int run_command(char* const command[], char* working_directory, pipe_data* input
 			// Redirect stdin
 			if (dup2(input_pipe->files.read_from, 0) < 0){
 				pipe_data_close_read_from(input_pipe);
-				fprintf(stderr, "Failed to redirect input for command %s\n", command[0]);
+				fprintf(stderr, "Failed to redirect input for fork\n");
 				exit(1);
 			}
 			pipe_data_close_write_to(input_pipe); // We don't need this anymore
@@ -58,22 +53,56 @@ int run_command(char* const command[], char* working_directory, pipe_data* input
 			// Redirect stdout
 			if (dup2(output_pipe->files.write_to, 1) < 0){
 				pipe_data_close_write_to(output_pipe);
-				fprintf(stderr, "Failed to redirect output for command %s\n", command[0]);
+				fprintf(stderr, "Failed to redirect output for fork\n");
 				exit(1);
 			}
 			pipe_data_close_read_from(output_pipe); // We don't need this anymore
 		}
 		// Redirect stderr to /dev/null
-		if (mute_stderr != 0) freopen("/dev/null", "w", stderr);
+		if (err_pipe == NULL){
+			//freopen("/dev/null", "w", stderr);
+		}else{
+			// Redirect stderr
+			if (dup2(err_pipe->files.write_to, 2) < 0){
+				pipe_data_close_write_to(err_pipe);
+				fprintf(stderr, "Failed to redirect stderr for fork\n");
+				exit(1);
+			}
+			pipe_data_close_read_from(err_pipe); // We don't need this anymore
+		}
 		if (working_directory != NULL){
 			chdir(working_directory);
 		}
-		// Run ffmpeg
-		execvp(command[0], command);
-		// Handle ffmpeg failing
-		// TODO: This won't display (i think)
-		fprintf(stderr, "Failed to exec() command %s with err %s\n", command[0], strerror(errno));
-		exit(1);
+		// Run the command, exit with returned status
+		// Use _exit so we don't call exit handlers
+		_exit((*func)(data));
+		break;
+	default:
+		// We are the parent
+		if (err_pipe != NULL) pipe_data_close_write_to(err_pipe);
+		if (output_pipe != NULL) pipe_data_close_write_to(output_pipe);
+		if (input_pipe != NULL) pipe_data_close_read_from(input_pipe);
 	}
 	return process_id;
+}
+
+int exec_from_void(void* command){
+	char** actual_command = (char**)command;
+	execvp(actual_command[0], actual_command);
+	fprintf(stderr, "Failed to exec() command %s with err %s\n", actual_command[0], strerror(errno));
+	return 1;
+}
+
+pid_t run_command(char* const command[], char* working_directory, pipe_data* input_pipe, pipe_data* output_pipe, pipe_data* err_pipe){
+	return fork_to_function(&exec_from_void, (void*)command, working_directory, input_pipe, output_pipe, err_pipe);
+}
+
+int fix_carriage_return_passthrough(void* arg){
+	int c;
+	while((c = getc(stdin)) != EOF){
+		fputc(c == '\r' ? '\n' : c, stdout);
+	}
+	fflush(stdout);
+	fclose(stdout);
+	return 0;
 }

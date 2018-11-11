@@ -7,7 +7,6 @@
 
 typedef struct {
 	char absolute_filename[PATH_MAX];
-	FILE* file;
 } temp_file;
 temp_file* create_temp_file(char* access_type){
 	struct stat st = {0};
@@ -25,18 +24,19 @@ temp_file* create_temp_file(char* access_type){
 	temp_file* tfile = malloc(sizeof(temp_file));
 	
 	realpath(filename, tfile->absolute_filename);
-	tfile->file = fdopen(file_descriptor, access_type);
+	close(file_descriptor);
+//tfile->file = fdopen(file_descriptor, access_type);
 	return tfile;
 }
 void free_temp_file(temp_file** tfile_pointer){
 	// The temp file will automatically be destroyed once unlinked
 	unlink((*tfile_pointer)->absolute_filename);
-	fclose((*tfile_pointer)->file);
+	//fclose((*tfile_pointer)->file);
 	free(*tfile_pointer);
 	*tfile_pointer = NULL;
 }
 void reopen_temp_file(temp_file* tfile, char* access_type){
-	tfile->file = freopen(tfile->absolute_filename, access_type, tfile->file);
+	//tfile->file = freopen(tfile->absolute_filename, access_type, tfile->file);
 }
 
 #define INITIAL_FRAME_BUFFER_SIZE 64

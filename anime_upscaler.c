@@ -19,28 +19,27 @@
 #include "process_utils.h"
 #include "temp_files.h"
 
-typedef struct {
-	int pid;
-	pipe_data input_pipe;
-} waifu2x_process_data;
-
 static volatile sig_atomic_t stop_signalled = 0;
 static volatile sig_atomic_t ffmpeg_src_stopped = 0;
 
 static struct {
 	union {
-		volatile _Atomic pid_t processes[3];
+		volatile _Atomic pid_t processes[6];
 		struct {
 			volatile _Atomic pid_t ffmpeg_src_process;
 		   	volatile _Atomic pid_t ffmpeg_rst_process;
 			volatile _Atomic pid_t waifu2x_process;
+
+			volatile _Atomic pid_t ffmpeg_src_monitor_process;
+			volatile _Atomic pid_t ffmpeg_rst_monitor_process;
+			volatile _Atomic pid_t waifu2x_monitor_process;
 		};
 	};
 	temp_frame* temp_frames;
 	size_t temp_frame_count;
 } session_data = { .processes={0}, .temp_frames=NULL, .temp_frame_count=0};
 void stop_program_from_signal(int sig){
-	if (sig == SIGCHLD){
+	/*if (sig == SIGCHLD){
 		int exit_status = 0;
 		pid_t exited_pid = wait(&exit_status);
 		if (atomic_load(&session_data.ffmpeg_src_process) == exited_pid)
@@ -48,13 +47,13 @@ void stop_program_from_signal(int sig){
 		// Ignore SIGCHLD if it's a clean exit
 		// TODO: Unclean exits should be captured also
 		if (WIFEXITED(exit_status)) return;
-	}
+		}*/
 	if (stop_signalled) return;
 	
 	if (sig == SIGINT) signal(SIGINT, SIG_IGN);
 	
 	int i;
-	for (i = 0; i < 3; i++){
+	for (i = 0; i < 6; i++){
 		size_t process_to_kill = atomic_load(&session_data.processes[i]);
 		if (process_to_kill != 0)
 			kill(process_to_kill, SIGINT);
@@ -73,7 +72,6 @@ void cleanup(){
 }
 
 // Use waifu2x to upscale 16 images per round
-//#define FRAMES_PER_UPSCALE_ROUND 256
 #define MAX_FRAMERATE_CHARACTERS 10
 typedef struct {
 	float framerate;
@@ -82,36 +80,16 @@ typedef struct {
 	unsigned int height;
 } source_file_data;
 void fill_source_file_data(char* filepath, source_file_data* output, size_t output_length){
-	//const char* ffmpeg_framerate_command_format = "ffmpeg -i -hide_banner %s 2>&1 | sed -n \"s/.*, \\(.*\\) fps.*/\\1/p\"";
-	/*const size_t ffmpeg_framerate_command_length = strlen(ffmpeg_framerate_command_format) + strlen(filepath) + 1;
-	char* ffmpeg_framerate_command = calloc(ffmpeg_framerate_command_length, sizeof(char));
-	snprintf(ffmpeg_framerate_command, ffmpeg_framerate_command_length, ffmpeg_framerate_command_format, filepath);
-
-	pipe_data ffmpeg_framerate_output_pipe = create_pipe_data();
-	char* ffmpeg_framerate_invocation_command[] = { "bash", "-c", ffmpeg_framerate_command, NULL };
-	pid_t ffmpeg_framerate_pid = run_command(ffmpeg_framerate_invocation_command, NULL, NULL, &ffmpeg_framerate_output_pipe, 0);
-	pipe_data_close_write_to(&ffmpeg_framerate_output_pipe);
-
-	FILE* ffmpeg_framerate_output = fdopen(ffmpeg_framerate_output_pipe.files.read_from, "r");
-	fread(output, sizeof(char), output_length, ffmpeg_framerate_output);
-	// Remove trailing newline
-	output[strcspn(output, "\n")] = 0;
-	
-	fclose(ffmpeg_framerate_output);
-	// This ends up closing the pipe?
-	free(ffmpeg_framerate_command);*/
-
-
 	char* ffprobe_command[] = { "ffprobe",
-									  "-v", "error", // Only log extra messages on error
-									  "-select_streams", "v:0", // Print data on first video stream
-									  "-show_entries", "stream=width,height,avg_frame_rate", // Print width, then height, then fps
-									  "-of", "csv=p=0", // Format as CSV
-									  filepath,
-									  NULL };
+								"-v", "error", // Only log extra messages on error
+								"-select_streams", "v:0", // Print data on first video stream
+								"-show_entries", "stream=width,height,avg_frame_rate", // Print width, then height, then fps
+								"-of", "csv=p=0", // Format as CSV
+								filepath,
+								NULL };
 	pipe_data ffprobe_output_pipe = create_pipe_data();
 	pid_t ffprobe_output_pid = run_command(ffprobe_command, NULL, NULL, &ffprobe_output_pipe, 0);
-	pipe_data_close_write_to(&ffprobe_output_pipe);
+	//pipe_data_close_write_to(&ffprobe_output_pipe);
 
 	float fps_nom, fps_denom = 1.0f;
 	FILE* ffprobe_output = fdopen(ffprobe_output_pipe.files.read_from, "r");
@@ -121,9 +99,6 @@ void fill_source_file_data(char* filepath, source_file_data* output, size_t outp
 	}
 	output->framerate = fps_nom / fps_denom;
 	snprintf(output->framerate_str, MAX_FRAMERATE_CHARACTERS, "%f", output->framerate);
-	
-	// Remove trailing newline
-	//output[strcspn(output, "\n")] = 0;
 	
 	fclose(ffprobe_output);
 	// This ends up closing the pipe?
@@ -324,20 +299,22 @@ Total Upscale Rounds: %zu\n",
 		strlen(source_data.framerate_str) + 1;
 	char* ffmpeg_filter_command = calloc(ffmpeg_filter_command_length, sizeof(char));
 	snprintf(ffmpeg_filter_command, ffmpeg_filter_command_length, ffmpeg_filter_command_format, source_data.framerate_str);
-	char* ffmpeg_source_command[] = { "ffmpeg", "-y", "-hide_banner",
+	char* ffmpeg_source_command[] = { "ffmpeg", "-y",
 									  "-i", options.input_filepath,
 									  "-vf", ffmpeg_filter_command,
+									  "-hide_banner", "-loglevel", "panic", "-nostats", // Logging bits
 									  "-vcodec", "png", "-f", "image2pipe", "-",
 									  NULL };
-	pid_t ffmpeg_source_pid = run_command(ffmpeg_source_command, NULL, &ffmpeg_source_input_pipe, &ffmpeg_source_output_pipe, 0);
+	pid_t ffmpeg_source_pid = run_command(ffmpeg_source_command, NULL, &ffmpeg_source_input_pipe, &ffmpeg_source_output_pipe, NULL);
 	atomic_store(&session_data.ffmpeg_src_process, ffmpeg_source_pid);
 	free(ffmpeg_filter_command);
 	
 	dup2(dev_null_read, ffmpeg_source_input_pipe.files.write_to); // Send /dev/null to the input so that it doesn't use the terminal
-	pipe_data_close_read_from(&ffmpeg_source_input_pipe); // We shouldn't be able to read from the input
-	pipe_data_close_write_to(&ffmpeg_source_output_pipe); // We shouldn't be able to write to the output
+	//pipe_data_close_read_from(&ffmpeg_source_input_pipe); // We shouldn't be able to read from the input
+	//pipe_data_close_write_to(&ffmpeg_source_output_pipe); // We shouldn't be able to write to the output
     FILE *ffmpeg_source_output = fdopen(ffmpeg_source_output_pipe.files.read_from, "r"); // Open the output as a pipe so we can read it
-
+	//pipe_data_close_write_to(&ffmpeg_source_progress_pipe); // We shouldn't be able to write to the progress
+	
 	if (errno){
 		fprintf(stderr, "post ffmpeg src err: %s\n", strerror(errno));
 		errno = 0;
@@ -348,6 +325,7 @@ Total Upscale Rounds: %zu\n",
 	*/
 	pipe_data ffmpeg_result_input_pipe = create_pipe_data();
 	//pipe_data ffmpeg_result_output_pipe = create_pipe_data();
+	pipe_data ffmpeg_result_progress_pipe = create_pipe_data();
 
 	char* ffmpeg_scale_filter_format = "scale=%u:%u";
 	const size_t ffmpeg_scale_filter_length = strlen(ffmpeg_scale_filter_format)
@@ -357,7 +335,8 @@ Total Upscale Rounds: %zu\n",
 	char* ffmpeg_scale_filter = calloc(ffmpeg_scale_filter_length, sizeof(char));
 	snprintf(ffmpeg_scale_filter, ffmpeg_scale_filter_length, ffmpeg_scale_filter_format,
 			 options.target_width, options.target_height);
-	char* ffmpeg_result_command[] = { "ffmpeg", "-y", "-hide_banner",
+	char* ffmpeg_result_command[] = { "ffmpeg", "-y",
+									  "-hide_banner", "-loglevel", "panic", "-progress", "/dev/stderr", "-nostats", // Logging bits
 									  "-i", options.input_filepath,
 									  "-r", source_data.framerate_str,
 									  "-vcodec", "png", "-f", "image2pipe", "-i", "-",
@@ -366,15 +345,20 @@ Total Upscale Rounds: %zu\n",
 									  "-vf", ffmpeg_scale_filter,
 									  options.output_filepath,
 									  NULL };
-	pid_t ffmpeg_result_pid = run_command(ffmpeg_result_command, NULL, &ffmpeg_result_input_pipe, NULL, 0);//&ffmpeg_result_output_pipe);
+	pid_t ffmpeg_result_pid = run_command(ffmpeg_result_command, NULL, &ffmpeg_result_input_pipe, NULL, &ffmpeg_result_progress_pipe);
 	atomic_store(&session_data.ffmpeg_rst_process, ffmpeg_result_pid);
 	free(ffmpeg_scale_filter);
 	
 	FILE *ffmpeg_result_input = fdopen(ffmpeg_result_input_pipe.files.write_to, "w"); // Open the input as a pipe so we can put images in it
-	pipe_data_close_read_from(&ffmpeg_result_input_pipe); // We shouldn't be able to read from the input
+	//pipe_data_close_read_from(&ffmpeg_result_input_pipe); // We shouldn't be able to read from the input
 	//pipe_data_close_write_to(&ffmpeg_result_output_pipe); // We shouldn't be able to write to the output
 	//dup2(dev_null_write, ffmpeg_result_output_pipe.files.read_from); // Send the output to /dev/null because we don't care about it
 
+	char* ffmpeg_grep_filter_command[] = { "sed", "-n", "-r", "s/frame=([0-9]+)/\\1/p", "-", NULL};
+	pipe_data ffmpeg_result_framecount_pipe = create_pipe_data();
+	pid_t ffmpeg_result_progress_pid = run_command(ffmpeg_grep_filter_command, NULL, &ffmpeg_result_progress_pipe, &ffmpeg_result_framecount_pipe, NULL);
+	FILE* ffmpeg_result_framecount_file = fdopen(ffmpeg_result_framecount_pipe.files.read_from, "r");
+	
 	if (errno){
 		fprintf(stderr, "post ffmpeg res err: %s\n", strerror(errno));
 		errno = 0;
@@ -402,21 +386,26 @@ Total Upscale Rounds: %zu\n",
 	
     // waifu2x doesn't like using stdout
 	char* waifu2x_noise_command[] = { "th", options.waifu2x_file,
-								"-force_cudnn", "1",
-								"-model_dir", options.waifu2x_model,
-								"-m", "noise_scale", "-noise_level", "1",
-								"-l", "/dev/stdin",
-								"-o", session_data.temp_frames[0].generic_output_filename, // TODO: Only do one calculation for generic_output_filename
-								NULL };
+									  "-force_cudnn", "1",
+									  "-model_dir", options.waifu2x_model,
+									  "-m", "noise_scale", "-noise_level", "1",
+									  "-l", "/dev/stdin",
+									  "-o", session_data.temp_frames[0].generic_output_filename, // TODO: Only do one calculation for generic_output_filename
+									  NULL };
 	char* waifu2x_scale_only_command[] = { "th", options.waifu2x_file,
-								"-force_cudnn", "1",
-								"-model_dir", options.waifu2x_model,
-								"-m", "scale",
-								"-l", "/dev/stdin",
-								"-o", session_data.temp_frames[0].generic_output_filename, // TODO: Only do one calculation for generic_output_filename
-								NULL };
-	//const size_t waifu2x_command_output_file_index = 7; 
-	waifu2x_process_data waifu2x_process;
+										   "-force_cudnn", "1",
+										   "-model_dir", options.waifu2x_model,
+										   "-m", "scale",
+										   "-l", "/dev/stdin",
+										   "-o", session_data.temp_frames[0].generic_output_filename, // TODO: Only do one calculation for generic_output_filename
+										   NULL };
+	char* waifu2x_result_process_command[] = { "stdbuf", "-oL", "bash", "-c",
+											   // These don't have commas, they will be concatanated
+											   "sed -u \""
+											   "s/[^[:print:]\\n]//g;"
+											   "s/.*Step: //g"
+											   "\"",
+											   NULL	};
 	if (errno){
 		fprintf(stderr, "prelooperr: %s\n", strerror(errno));
 		errno = 0;
@@ -451,14 +440,16 @@ Total Upscale Rounds: %zu\n",
 		for (upscale_round = 0; upscale_round < upscale_rounds; upscale_round++){
 			for (frame_input_index = 0; frame_input_index < total_frames_this_round; frame_input_index++){
 				temp_frame* frame = &session_data.temp_frames[frame_input_index];
-                // Write the buffers' data out 
-				expandable_buffer_write_to_file(&frame->buffer, frame->file->file);
-				fflush(frame->file->file);
+                // Write the buffers' data out
+				FILE* output_file = fopen(frame->file->absolute_filename, "wb");
+				expandable_buffer_write_to_file(&frame->buffer, output_file);
+				fflush(output_file);
+				fclose(output_file);
 			}
 			
 			// Wait for waifu2x
-			waifu2x_process.input_pipe = create_pipe_data();
-			FILE* waifu2x_input_file = fdopen(waifu2x_process.input_pipe.files.write_to, "wb");
+			pipe_data waifu2x_input_pipe = create_pipe_data();
+			FILE* waifu2x_input_file = fdopen(waifu2x_input_pipe.files.write_to, "wb");
 			for (frame_output_index = 0; frame_output_index < total_frames_this_round; frame_output_index++){
 				temp_frame* frame = &session_data.temp_frames[frame_output_index];
 				
@@ -474,14 +465,65 @@ Total Upscale Rounds: %zu\n",
 				errno = 0;
 			}
 
+			pipe_data waifu2x_progress_pipe = create_pipe_data();
+			pipe_data waifu2x_crbuffered_progress_pipe = create_pipe_data();
+			pipe_data waifu2x_formatted_progress_pipe = create_pipe_data();
+
 			char** waifu2x_command = (upscale_round == 0) ? waifu2x_noise_command : waifu2x_scale_only_command;
-			waifu2x_process.pid = run_command(waifu2x_command, options.waifu2x_folder, &waifu2x_process.input_pipe, NULL, 0);
-			atomic_store(&session_data.waifu2x_process, waifu2x_process.pid);
-			pipe_data_close_read_from(&waifu2x_process.input_pipe);
+			pid_t waifu2x_pid = run_command(waifu2x_command, options.waifu2x_folder, &waifu2x_input_pipe, &waifu2x_progress_pipe, NULL);
+			atomic_store(&session_data.waifu2x_process, waifu2x_pid);
+			//pipe_data_close_read_from(&waifu2x_input_pipe);
+
+			pid_t waifu2x_carriage_return_pid = fork_to_function(&fix_carriage_return_passthrough, NULL, NULL, &waifu2x_progress_pipe, &waifu2x_crbuffered_progress_pipe, NULL);
+			pid_t waifu2x_process_result_pid = run_command(waifu2x_result_process_command, NULL, &waifu2x_crbuffered_progress_pipe, &waifu2x_formatted_progress_pipe, NULL);
 			
 			// If this is Ctrl-C'd, this program closes because of a bad pipe
 			// Soln. handle SIGPIPE like SIGINT etc.
-			waitid(P_PID, waifu2x_process.pid, NULL, WSTOPPED|WEXITED);
+			//waitid(P_PID, waifu2x_pid, NULL, WSTOPPED|WEXITED);
+			char* output_line = NULL;
+			size_t line_length = 100;
+			FILE* waifu2x_formatted_progress_file = fdopen(waifu2x_formatted_progress_pipe.files.read_from, "r");
+
+			char w2_step_string[100] = { '\0' };
+			unsigned int w2_upscaled_file_count = 0;
+			unsigned int w2_total_file_count = 0;
+			unsigned int encoded_frame_count = 0;
+			unsigned int w2_ended = 0;
+			while(1){
+				int poll_positive = 1;
+				while (poll_positive && !w2_ended){
+					int poll_result = poll(&(struct pollfd){ .fd = waifu2x_formatted_progress_pipe.files.read_from, .events = POLLIN }, 1, 0);
+					switch(poll_result){
+					case 1:
+						if (getline(&output_line, &line_length, waifu2x_formatted_progress_file) != -1){
+							sscanf(output_line, "%s %u/%u", w2_step_string, &w2_upscaled_file_count, &w2_total_file_count);
+						}else{
+							w2_ended = 1;
+						}
+						break;
+					case -1:
+						w2_ended = 1;
+						break;
+					default:
+						poll_positive = 0;
+					}
+				}
+				while (poll(&(struct pollfd){ .fd = ffmpeg_result_framecount_pipe.files.read_from, .events = POLLIN }, 1, 0)==1){
+					if (getline(&output_line, &line_length, ffmpeg_result_framecount_file) != -1){
+						sscanf(output_line, "%u", &encoded_frame_count);
+					}
+				}
+
+				fprintf(stderr, "\rCurrent batch has converted %u/%u frames at %s/frame, currently encoded: %u", w2_upscaled_file_count, w2_total_file_count, w2_step_string, encoded_frame_count);
+				if (w2_upscaled_file_count == w2_total_file_count && w2_total_file_count != 0) break;
+				if (stop_signalled != 0) break;
+				if (w2_ended != 0) break;
+			}
+			fprintf(stderr, "\n");
+			
+			
+			kill(waifu2x_carriage_return_pid, SIGKILL);
+			kill(waifu2x_process_result_pid, SIGKILL);
 			//pipe_data_close(&waifu2x_process.input_pipe);
 			//fprintf(stderr, "Done waiting\n");
 			if (errno){
@@ -494,9 +536,10 @@ Total Upscale Rounds: %zu\n",
 				
 				temp_frame* frame = &session_data.temp_frames[frame_output_index];
 				FILE* output_file = fopen(frame->output_filename, "rb");
-				if (expandable_buffer_read_png_in(&frame->buffer, output_file) != 0){
+				if (output_file == NULL || expandable_buffer_read_png_in(&frame->buffer, output_file) != 0){
+					fprintf(stderr, "err: %s\n", strerror(errno));
 					fprintf(stderr, "Error reading PNG from %s...\n", frame->output_filename);
-					exit(1);
+					exit(errno || 1);
 				}
 				fclose(output_file);
 			}
@@ -512,11 +555,15 @@ Total Upscale Rounds: %zu\n",
 			temp_frame* frame = &session_data.temp_frames[frame_output_index];
 			expandable_buffer_write_to_pipe(&frame->buffer, ffmpeg_result_input);
 		}
+		fflush(ffmpeg_result_input);
 		
 		if (stop_signalled != 0) fprintf(stderr, "got sigint\n");
 	}
 
 	if (stop_signalled) exit(0);
+
+	
+	kill(ffmpeg_result_progress_pid, SIGKILL);
 	
 	// Wait for the FFMpeg result process to finish
 	fflush(ffmpeg_result_input);
