@@ -30,6 +30,7 @@ static struct {
 		   	volatile _Atomic pid_t ffmpeg_rst_process;
 			volatile _Atomic pid_t waifu2x_process;
 
+			// TODO: Use these
 			volatile _Atomic pid_t ffmpeg_src_monitor_process;
 			volatile _Atomic pid_t ffmpeg_rst_monitor_process;
 			volatile _Atomic pid_t waifu2x_monitor_process;
@@ -487,7 +488,7 @@ Total Upscale Rounds: %zu\n",
 			char w2_step_string[100] = { '\0' };
 			unsigned int w2_upscaled_file_count = 0;
 			unsigned int w2_total_file_count = 0;
-			unsigned int encoded_frame_count = 0;
+			static unsigned int encoded_frame_count = 0;
 			unsigned int w2_ended = 0;
 			while(1){
 				int poll_positive = 1;
@@ -520,7 +521,6 @@ Total Upscale Rounds: %zu\n",
 				if (w2_ended != 0) break;
 			}
 			fprintf(stderr, "\n");
-			
 			
 			kill(waifu2x_carriage_return_pid, SIGKILL);
 			kill(waifu2x_process_result_pid, SIGKILL);
